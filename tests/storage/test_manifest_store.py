@@ -122,6 +122,37 @@ def test_atomic_write_uses_windows_write_through_replacement(
     assert calls[0][1] == path
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows symlink replacement semantics")
+def test_atomic_write_replaces_destination_symlink_without_touching_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches Windows replacement resolving the destination symlink first."""
+    external = tmp_path / "external.bin"
+    external.write_bytes(b"sentinel")
+    destination = tmp_path / "manifest.bin"
+    try:
+        destination.symlink_to(external)
+    except OSError as error:
+        if getattr(error, "winerror", None) != 1314:
+            raise
+        destination.write_bytes(b"old")
+        original_resolve = Path.resolve
+
+        def resolve_as_destination_symlink(path: Path, strict: bool = False) -> Path:
+            if path == destination:
+                return external
+            return original_resolve(path, strict=strict)
+
+        monkeypatch.setattr(Path, "resolve", resolve_as_destination_symlink)
+
+    atomic_write_bytes(destination, b"replacement")
+
+    assert external.read_bytes() == b"sentinel"
+    assert destination.read_bytes() == b"replacement"
+    assert not destination.is_symlink()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX durability dispatch")
 def test_atomic_write_fsyncs_parent_directory_after_replacement(
     tmp_path: Path,

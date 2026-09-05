@@ -40,8 +40,8 @@ def _replace_windows_write_through(source: Path, destination: Path) -> None:
     replace_existing = 0x1
     write_through = 0x8
     succeeded = move_file_ex(
-        str(source.resolve()),
-        str(destination.resolve()),
+        os.path.abspath(os.fspath(source)),
+        os.path.abspath(os.fspath(destination)),
         replace_existing | write_through,
     )
     if not succeeded:
