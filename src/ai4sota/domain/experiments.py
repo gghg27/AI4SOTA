@@ -105,6 +105,7 @@ class ResearchCommitManifest(SchemaHeader):
     snapshot_hash: ContentHash
     parent_research_commit_ids: tuple[NonEmptyStr, ...] = ()
     comparison_state: NonEmptyStr | None = None
+    aggregation: dict[NonEmptyStr, object] | None = None
 
     @field_validator("run_ids", "run_manifest_hashes")
     @classmethod
