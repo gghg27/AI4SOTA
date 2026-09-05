@@ -11,7 +11,10 @@ from .contracts import EvaluationResult, PredictionBundle
 from .io_utils import read_json, read_yaml, utc_now, write_json
 from .loading import load_project_module, require_callable
 from .project import resolve_project
+from .runs import prepare_run
 from .validation import validate_project
+
+__all__ = ["load_history", "prepare_run", "run_project"]
 
 
 def run_project(project_path: Path, note: str = "") -> dict[str, Any]:
