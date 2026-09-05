@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai4sota"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0,<3",
+  "pydantic>=2.10,<3",
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = ["mypy>=1.15,<2", "pytest>=8.3,<9", "pytest-cov>=6,<7", "ruff>=0.11,<1"]
+
+[project.scripts]
+ai4sota = "ai4sota.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ai4sota = ["templates/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"

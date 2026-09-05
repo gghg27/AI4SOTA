@@ -1,0 +1,4 @@
+target_key: label
+prediction_key: label
+split_key: split
+evaluate_split: test

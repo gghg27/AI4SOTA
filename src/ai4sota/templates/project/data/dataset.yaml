@@ -1,0 +1,14 @@
+source:
+  format: npz
+  path: placeholder.npz
+fields:
+  inputs:
+    features: X
+  targets:
+    label: y
+  metadata:
+    split: split
+    sample_ids: sample_ids
+split:
+  test_ratio: 0.25
+  random_seed: 42
