@@ -60,8 +60,21 @@ def assign_groups(
     groups: Sequence[str], protocol: SplitProtocolSpec, seed: int
 ) -> dict[str, str]:
     """Assign each group to one partition according to its declared protocol."""
-    unique_groups = list(dict.fromkeys(groups))
+    if protocol.folds is not None:
+        raise ValueError("protocol.folds is not supported by SplitManifest")
+    if protocol.repeats != 1:
+        raise ValueError("protocol.repeats must be 1 for SplitManifest")
+
+    unique_groups = sorted(set(groups))
     if protocol.kind == "declared_split":
+        if protocol.evaluate_split is None:
+            raise ValueError(
+                f"protocol.evaluate_split is required for metadata.{protocol.group_by}"
+            )
+        if protocol.evaluate_split not in unique_groups:
+            raise ValueError(
+                f"protocol.evaluate_split must exist in metadata.{protocol.group_by}"
+            )
         return {group: group for group in unique_groups}
     if protocol.kind != "group_holdout":
         raise ValueError(f"protocol.kind {protocol.kind!r} is not supported")
@@ -102,7 +115,7 @@ def _required_identifiers(
 
     normalized: list[str] = []
     for value in array:
-        if value is None or (isinstance(value, (float, np.floating)) and np.isnan(value)):
+        if _is_missing_identifier(value):
             raise ValueError(f"{field_name} must not contain null values")
         identifier = str(value).strip()
         if not identifier:
@@ -112,6 +125,16 @@ def _required_identifiers(
     if unique and len(set(normalized)) != len(normalized):
         raise ValueError(f"{field_name} must contain unique values")
     return tuple(normalized)
+
+
+def _is_missing_identifier(value: object) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, (float, np.floating, np.complexfloating)):
+        return bool(np.isnan(value))
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return bool(np.isnat(value))
+    return False
 
 
 def _content_hash(payload: dict[str, object]) -> str:
