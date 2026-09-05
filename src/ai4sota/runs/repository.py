@@ -169,7 +169,9 @@ def transition_run(run_dir: Path, expected: str, target: str) -> RunManifest:
             },
         )
         try:
-            _append_run_event_locked(directory, event, current.id)
+            _append_run_event_locked(
+                directory, event, current.id, allow_state_transition=True
+            )
         except Exception as error:
             raise RunPersistenceError("could not persist transition event") from error
         try:
@@ -193,6 +195,7 @@ def _recover_pending_transition(
             return None
         if current.content_hash != source_hash:
             continue
+        _validate_pending_transition(event, current, target)
         if _requires_integrity_check(current.status, target.status):
             verify_run_integrity(run_dir)
         try:
@@ -242,7 +245,44 @@ def _event_target_manifest(event: RunEvent, directory_name: str) -> RunManifest 
         or target.status != event.status
     ):
         raise RunManifestIntegrityError("transition event projection is inconsistent")
+    previous_status = event.previous_status
+    if (
+        previous_status is None
+        or target.status not in ALLOWED_TRANSITIONS.get(previous_status, ())
+    ):
+        raise RunManifestIntegrityError(
+            "transition event does not describe a legal lifecycle transition"
+        )
+    source_hash = event.details.get("source_manifest_hash")
+    source = target.model_copy(update={"status": previous_status})
+    if not isinstance(source_hash, str) or canonical_manifest_hash(source) != source_hash:
+        raise RunManifestIntegrityError(
+            "transition event source manifest hash is inconsistent"
+        )
     return target
+
+
+def _validate_pending_transition(
+    event: RunEvent, current: RunManifest, target: RunManifest
+) -> None:
+    if event.details.get("source_manifest_hash") != current.content_hash:
+        raise RunManifestIntegrityError(
+            "transition event source manifest hash is inconsistent"
+        )
+    if event.previous_status != current.status:
+        raise RunManifestIntegrityError(
+            "transition event previous status does not match its source manifest"
+        )
+    current_projection = current.model_dump(
+        mode="json", exclude={"content_hash", "status"}
+    )
+    target_projection = target.model_dump(
+        mode="json", exclude={"content_hash", "status"}
+    )
+    if target_projection != current_projection:
+        raise RunManifestIntegrityError(
+            "transition event projection changes fields other than status"
+        )
 
 
 def _read_run_events(run_dir: Path, run_id: str) -> tuple[RunEvent, ...]:

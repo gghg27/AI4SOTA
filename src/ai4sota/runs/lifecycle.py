@@ -49,11 +49,19 @@ def append_run_event(run_dir: Path, event: RunEvent) -> None:
         _append_run_event_locked(directory, event, manifest.id)
 
 
-def _append_run_event_locked(run_dir: Path, event: RunEvent, run_id: str) -> None:
+def _append_run_event_locked(
+    run_dir: Path,
+    event: RunEvent,
+    run_id: str,
+    *,
+    allow_state_transition: bool = False,
+) -> None:
     if event.run_id != run_id:
         raise ValueError(
             f"event run id {event.run_id!r} does not match ledger Run {run_id!r}"
         )
+    if event.event_type == "run_state_transition" and not allow_state_transition:
+        raise ValueError("run_state_transition is reserved for lifecycle operations")
     _append_json_line(run_dir / "events.jsonl", event.model_dump_json())
 
 

@@ -115,6 +115,76 @@ def test_durable_replace_publishes_a_complete_directory(tmp_path: Path) -> None:
     )
 
 
+def test_atomic_write_durably_creates_each_missing_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches nested parent entries remaining only in directory caches."""
+    path = tmp_path / "one" / "two" / "manifest.bin"
+    synced: list[Path] = []
+    monkeypatch.setattr(
+        atomic_module, "_DIRECTORY_FSYNC_SUPPORTED", True, raising=False
+    )
+    monkeypatch.setattr(
+        atomic_module, "_USE_WINDOWS_WRITE_THROUGH", False, raising=False
+    )
+    monkeypatch.setattr(atomic_module, "_fsync_parent_directory", synced.append)
+
+    atomic_write_bytes(path, b"durable")
+
+    assert path.read_bytes() == b"durable"
+    assert synced == [tmp_path, tmp_path / "one", tmp_path / "one" / "two"]
+
+
+def test_sync_directory_tree_includes_empty_directories_bottom_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches empty and intermediate staged directories escaping fsync."""
+    root = tmp_path / "staged-run"
+    nested = root / "snapshot" / "modules"
+    empty = root / "artifacts"
+    nested.mkdir(parents=True)
+    empty.mkdir()
+    synced: list[Path] = []
+    monkeypatch.setattr(
+        atomic_module, "_DIRECTORY_FSYNC_SUPPORTED", True, raising=False
+    )
+    monkeypatch.setattr(atomic_module, "_fsync_directory", synced.append)
+
+    atomic_module.sync_directory_tree(root)
+
+    assert set(synced) == {root, root / "snapshot", nested, empty}
+    assert synced.index(nested) < synced.index(root / "snapshot") < synced.index(root)
+    assert synced.index(empty) < synced.index(root)
+
+
+def test_durable_replace_syncs_a_directory_tree_and_both_parents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches cross-directory publication persisting only its destination."""
+    source = tmp_path / "staging" / "run-001"
+    destination = tmp_path / "runs" / "run-001"
+    source.mkdir(parents=True)
+    destination.parent.mkdir()
+    tree_syncs: list[Path] = []
+    parent_syncs: list[Path] = []
+    monkeypatch.setattr(
+        atomic_module, "_DIRECTORY_FSYNC_SUPPORTED", True, raising=False
+    )
+    monkeypatch.setattr(
+        atomic_module, "_USE_WINDOWS_WRITE_THROUGH", False, raising=False
+    )
+    monkeypatch.setattr(atomic_module, "sync_directory_tree", tree_syncs.append)
+    monkeypatch.setattr(
+        atomic_module, "_fsync_parent_directory", parent_syncs.append
+    )
+
+    durable_replace(source, destination)
+
+    assert tree_syncs == [source]
+    assert parent_syncs == [source.parent, destination.parent]
+    assert destination.is_dir()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows durability dispatch")
 def test_atomic_write_uses_windows_write_through_replacement(
     tmp_path: Path,

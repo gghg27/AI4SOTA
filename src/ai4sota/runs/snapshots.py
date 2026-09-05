@@ -31,6 +31,7 @@ from ai4sota.storage import (
     ManifestStore,
     atomic_write_bytes,
     canonical_manifest_hash,
+    durable_make_directory,
     durable_replace,
 )
 
@@ -81,6 +82,7 @@ def prepare_run(project: ProjectLayout, experiment: ExperimentSpec) -> RunManife
             f"experiment project {experiment.project_id!r} does not match "
             f"{project_spec.id!r}"
         )
+    _verify_active_project_references(project, project_spec)
 
     task_file = _read_file(project.task_file, "task contract")
     task = _verified_manifest(
@@ -180,7 +182,7 @@ def prepare_run(project: ProjectLayout, experiment: ExperimentSpec) -> RunManife
     staging = project.index_file.parent / run_id
     if run_dir.exists():
         raise FileExistsError(f"Run directory already exists: {run_dir}")
-    staging.mkdir(parents=True)
+    durable_make_directory(staging)
     try:
         snapshot = staging / "snapshot"
         for relative_path, value in sorted(relative_inputs.items()):
@@ -217,7 +219,7 @@ def prepare_run(project: ProjectLayout, experiment: ExperimentSpec) -> RunManife
         )
         ManifestStore().write(staging / "manifest.yaml", manifest)
         for name in ("logs", "metrics", "artifacts"):
-            (staging / name).mkdir()
+            durable_make_directory(staging / name)
         append_run_event(
             staging,
             RunEvent(
@@ -238,6 +240,24 @@ def prepare_run(project: ProjectLayout, experiment: ExperimentSpec) -> RunManife
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+def _verify_active_project_references(
+    project: ProjectLayout, project_spec: ProjectSpec
+) -> None:
+    active_task = project.task_file.relative_to(project.root).as_posix()
+    if project_spec.active_task != active_task:
+        raise SnapshotValidationError(
+            f"project active task must be {active_task!r}, "
+            f"found {project_spec.active_task!r}"
+        )
+    for kind in ModuleKind:
+        active_module = project.module_dir(kind).relative_to(project.root).as_posix()
+        if project_spec.active_modules[kind] != active_module:
+            raise SnapshotValidationError(
+                f"project active {kind.value} module must be {active_module!r}, "
+                f"found {project_spec.active_modules[kind]!r}"
+            )
 
 
 def _verify_exact_input_map(

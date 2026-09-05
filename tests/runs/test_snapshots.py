@@ -14,6 +14,7 @@ from ai4sota.domain import (
     ExperimentSpec,
     MethodSpec,
     ModuleKind,
+    ProjectSpec,
     SplitManifest,
 )
 from ai4sota.files.hashing import sha256_file
@@ -110,6 +111,44 @@ def test_prepare_run_rechecks_approved_module_hashes_before_copying(
 
     with pytest.raises(SnapshotValidationError, match="method module"):
         prepare_run(project, experiment)
+
+    assert list(project.runs_dir.iterdir()) == []
+
+
+def test_prepare_run_rejects_a_different_active_task_reference(
+    runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
+) -> None:
+    """Catches a valid project manifest selecting a task outside the snapshot."""
+    project, experiment, _ = runnable_project
+    updated = _rewrite_manifest(
+        project.project_file, ProjectSpec, active_task="tasks/other.yaml"
+    )
+    rebound = _rebind_experiment(project, experiment, project.project_file)
+
+    with pytest.raises(SnapshotValidationError, match="active task"):
+        prepare_run(project, rebound)
+
+    assert updated.active_task == "tasks/other.yaml"
+    assert list(project.runs_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("kind", list(ModuleKind))
+def test_prepare_run_rejects_a_different_active_module_reference(
+    runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
+    kind: ModuleKind,
+) -> None:
+    """Catches project-selected modules differing from the snapshotted trees."""
+    project, experiment, _ = runnable_project
+    current = ManifestStore().read(project.project_file, ProjectSpec)
+    active_modules = dict(current.active_modules)
+    active_modules[kind] = f"modules/{kind.value}/alternate"
+    _rewrite_manifest(
+        project.project_file, ProjectSpec, active_modules=active_modules
+    )
+    rebound = _rebind_experiment(project, experiment, project.project_file)
+
+    with pytest.raises(SnapshotValidationError, match=f"active {kind.value} module"):
+        prepare_run(project, rebound)
 
     assert list(project.runs_dir.iterdir()) == []
 

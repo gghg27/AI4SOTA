@@ -51,6 +51,36 @@ def make_run(run_dir: Path, status: str = "draft") -> RunManifest:
     return manifest
 
 
+def write_transition_event(
+    run_dir: Path,
+    current: RunManifest,
+    *,
+    previous_status: str,
+    target_status: str,
+    target_updates: dict[str, object] | None = None,
+    source_hash: str | None = None,
+) -> None:
+    draft = current.model_copy(
+        update={"status": target_status, **(target_updates or {})}
+    )
+    target = draft.model_copy(update={"content_hash": canonical_manifest_hash(draft)})
+    event = RunEvent(
+        id="event-forged",
+        run_id=current.id,
+        event_type="run_state_transition",
+        previous_status=previous_status,
+        status=target_status,
+        details={
+            "source_manifest_hash": source_hash or current.content_hash,
+            "target_manifest_hash": target.content_hash,
+            "target_manifest": target.model_dump(mode="json"),
+        },
+    )
+    (run_dir / "events.jsonl").write_text(
+        event.model_dump_json() + "\n", encoding="utf-8"
+    )
+
+
 def test_append_run_event_is_append_only_and_fsyncs_each_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -103,6 +133,25 @@ def test_append_run_event_rejects_an_event_for_a_different_run(
     with pytest.raises(ValueError, match="run id"):
         append_run_event(run_dir, event)
 
+    assert not (run_dir / "events.jsonl").exists()
+
+
+def test_append_run_event_rejects_reserved_state_transitions(tmp_path: Path) -> None:
+    """Catches public event writers forging authoritative lifecycle facts."""
+    run_dir = tmp_path / "run-001"
+    original = make_run(run_dir, status="queued")
+    event = RunEvent(
+        id="event-forged",
+        run_id=original.id,
+        event_type="run_state_transition",
+        previous_status="queued",
+        status="succeeded",
+    )
+
+    with pytest.raises(ValueError, match="reserved"):
+        append_run_event(run_dir, event)
+
+    assert load_run_manifest(run_dir) == original
     assert not (run_dir / "events.jsonl").exists()
 
 
@@ -265,6 +314,77 @@ def test_transition_recovers_a_durable_event_after_projection_failure(
     assert recovered.status == "preparing"
     assert load_run_manifest(run_dir) == recovered
     assert (run_dir / "events.jsonl").read_bytes().count(b"\n") == 1
+
+
+@pytest.mark.parametrize(
+    ("previous_status", "target_status", "target_updates"),
+    [
+        ("draft", "preparing", None),
+        ("queued", "succeeded", None),
+        ("queued", "preparing", {"integrity_state": "forged"}),
+    ],
+)
+def test_transition_recovery_rejects_forged_projections(
+    tmp_path: Path,
+    previous_status: str,
+    target_status: str,
+    target_updates: dict[str, object] | None,
+) -> None:
+    """Catches recovery bypassing the graph or mutating non-status fields."""
+    run_dir = tmp_path / "run-001"
+    original = make_run(run_dir, status="queued")
+    write_transition_event(
+        run_dir,
+        original,
+        previous_status=previous_status,
+        target_status=target_status,
+        target_updates=target_updates,
+    )
+
+    with pytest.raises(RunManifestIntegrityError, match="transition event"):
+        transition_run(run_dir, expected="queued", target="preparing")
+
+    assert load_run_manifest(run_dir) == original
+
+
+def test_transition_recovery_rejects_a_direct_queued_to_running_event(
+    tmp_path: Path,
+) -> None:
+    """Catches a forged recovery event skipping preparation and its checks."""
+    run_dir = tmp_path / "run-001"
+    original = make_run(run_dir, status="queued")
+    write_transition_event(
+        run_dir,
+        original,
+        previous_status="queued",
+        target_status="running",
+    )
+    (run_dir / "snapshot" / "model.py").write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(RunManifestIntegrityError, match="transition event"):
+        transition_run(run_dir, expected="queued", target="preparing")
+
+    assert load_run_manifest(run_dir) == original
+
+
+def test_transition_recovery_rejects_an_inconsistent_source_hash(
+    tmp_path: Path,
+) -> None:
+    """Catches recovery ignoring source hashes that cannot produce the target."""
+    run_dir = tmp_path / "run-001"
+    original = make_run(run_dir, status="queued")
+    write_transition_event(
+        run_dir,
+        original,
+        previous_status="queued",
+        target_status="preparing",
+        source_hash="sha256:" + "f" * 64,
+    )
+
+    with pytest.raises(RunManifestIntegrityError, match="source manifest hash"):
+        transition_run(run_dir, expected="queued", target="preparing")
+
+    assert load_run_manifest(run_dir) == original
 
 
 def test_transition_wraps_event_persistence_failure_without_projection(
