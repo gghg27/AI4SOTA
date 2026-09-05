@@ -2,7 +2,7 @@
 
 from .atomic import atomic_write_bytes
 from .index import ResearchIndex
-from .manifests import ManifestStore
+from .manifests import ManifestStore, canonical_manifest_hash
 from .migrations import (
     MigrationPlan,
     apply_schema_migration,
@@ -15,5 +15,6 @@ __all__ = [
     "ResearchIndex",
     "apply_schema_migration",
     "atomic_write_bytes",
+    "canonical_manifest_hash",
     "plan_schema_migration",
 ]

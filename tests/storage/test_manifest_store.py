@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+import ai4sota.storage.atomic as atomic_module
 from ai4sota.domain import TaskContract
-from ai4sota.storage import ManifestStore, atomic_write_bytes
+from ai4sota.storage import (
+    ManifestStore,
+    atomic_write_bytes,
+    canonical_manifest_hash,
+)
 
 CONTENT_HASH = "sha256:" + "a" * 64
 TASK_FIXTURE = {
@@ -20,6 +27,26 @@ TASK_FIXTURE = {
     "classes": {"negative": 0, "neutral": 1},
     "required_metadata": ["subject_id"],
 }
+
+
+def test_canonical_manifest_hash_is_ordered_and_excludes_its_own_field() -> None:
+    """Catches unstable hashing or a self-referential content hash."""
+    first = {
+        "id": "x",
+        "content_hash": "sha256:" + "f" * 64,
+        "api_version": "ai4sota/v1",
+    }
+    second = {
+        "api_version": "ai4sota/v1",
+        "id": "x",
+        "content_hash": "sha256:" + "0" * 64,
+    }
+
+    assert canonical_manifest_hash(first) == (
+        "sha256:b1b69890623096f383947d46632cf21b"
+        "723d41b44cc86d766956c40fa492f0d0"
+    )
+    assert canonical_manifest_hash(second) == canonical_manifest_hash(first)
 
 
 def test_manifest_write_is_readable_and_leaves_no_temp_file(tmp_path: Path) -> None:
@@ -68,3 +95,52 @@ def test_atomic_write_replaces_existing_bytes_without_temp_files(tmp_path: Path)
 
     assert path.read_bytes() == b"new"
     assert list(path.parent.glob("*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows durability dispatch")
+def test_atomic_write_uses_windows_write_through_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches Windows replacement returning before metadata is durable."""
+    path = tmp_path / "manifest.bin"
+    calls: list[tuple[Path, Path]] = []
+    real_replace = atomic_module._replace_windows_write_through
+
+    def observed_replace(source: Path, destination: Path) -> None:
+        calls.append((source, destination))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(
+        atomic_module, "_replace_windows_write_through", observed_replace
+    )
+
+    atomic_write_bytes(path, b"durable")
+
+    assert path.read_bytes() == b"durable"
+    assert len(calls) == 1
+    assert calls[0][1] == path
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX durability dispatch")
+def test_atomic_write_fsyncs_parent_directory_after_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches POSIX rename metadata remaining only in the directory cache."""
+    path = tmp_path / "manifest.bin"
+    synced_modes: list[int] = []
+    real_fsync = os.fsync
+
+    def observed_fsync(file_descriptor: int) -> None:
+        synced_modes.append(os.fstat(file_descriptor).st_mode)
+        real_fsync(file_descriptor)
+
+    monkeypatch.setattr(atomic_module.os, "fsync", observed_fsync)
+
+    atomic_write_bytes(path, b"durable")
+
+    assert path.read_bytes() == b"durable"
+    assert len(synced_modes) == 2
+    assert stat.S_ISREG(synced_modes[0])
+    assert stat.S_ISDIR(synced_modes[1])

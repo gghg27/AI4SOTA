@@ -18,6 +18,7 @@ from ai4sota.domain.modules import (
     MethodSpec,
     ModuleKind,
     PreprocessingSpec,
+    SplitProtocolSpec,
 )
 from ai4sota.domain.projects import ProjectSpec
 from ai4sota.domain.task import TaskContract
@@ -159,6 +160,17 @@ def test_module_entrypoints_and_metric_ownership_are_enforced() -> None:
                 {"name": "macro_f1", "primary": True, "implementation": "builtin/v1"},
             ],
         )
+
+
+def test_split_protocol_preserves_the_declared_evaluation_partition() -> None:
+    """Catches Phase 1's evaluate_split being dropped from typed persistence."""
+    protocol = SplitProtocolSpec(
+        kind="declared_split",
+        group_by="split",
+        evaluate_split="test",
+    )
+
+    assert protocol.evaluate_split == "test"
 
 
 def test_ledger_manifests_round_trip_exact_content_addresses() -> None:

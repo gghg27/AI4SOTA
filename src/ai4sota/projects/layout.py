@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import shutil
 from dataclasses import dataclass
 from importlib.resources import files
@@ -11,7 +9,11 @@ from pathlib import Path
 from typing import Any
 
 from ai4sota.domain import ModuleKind, ProjectSpec
-from ai4sota.storage import ManifestStore, atomic_write_bytes
+from ai4sota.storage import (
+    ManifestStore,
+    atomic_write_bytes,
+    canonical_manifest_hash,
+)
 
 
 @dataclass(frozen=True)
@@ -44,8 +46,10 @@ class ProjectLayout:
                 "active_modules": {
                     kind.value: f"modules/{kind.value}/current" for kind in ModuleKind
                 },
+                "content_hash": "sha256:" + "0" * 64,
             }
-            project_value["content_hash"] = _content_hash(project_value)
+            project = ProjectSpec.model_validate(project_value)
+            project_value["content_hash"] = canonical_manifest_hash(project)
             ManifestStore().write(
                 layout.project_file, ProjectSpec.model_validate(project_value)
             )
@@ -126,11 +130,6 @@ def _validate_project_name(name: str) -> str:
     if normalized in {".", ".."} or any(char in normalized for char in '<>:"/\\|?*'):
         raise ValueError("project name contains characters that are invalid on common platforms")
     return normalized
-
-
-def _content_hash(value: dict[str, Any]) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 def _copy_template_tree(source: Any, target: Path) -> None:

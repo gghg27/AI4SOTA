@@ -6,7 +6,7 @@ import pytest
 
 from ai4sota.domain import ModuleKind, ProjectSpec
 from ai4sota.projects import ProjectLayout
-from ai4sota.storage import ManifestStore
+from ai4sota.storage import ManifestStore, canonical_manifest_hash
 
 
 def test_project_layout_creates_authoritative_directories(tmp_path: Path) -> None:
@@ -43,6 +43,7 @@ def test_project_layout_writes_a_valid_project_manifest(tmp_path: Path) -> None:
         ModuleKind.METHOD: "modules/method/current",
         ModuleKind.EVALUATION: "modules/evaluation/current",
     }
+    assert project.content_hash == canonical_manifest_hash(project)
 
 
 def test_project_layout_refuses_to_overwrite_an_existing_project(tmp_path: Path) -> None:

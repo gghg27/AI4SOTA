@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -13,6 +14,23 @@ from pydantic import BaseModel
 from .atomic import atomic_write_bytes
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+def canonical_manifest_hash(value: BaseModel | Mapping[str, Any]) -> str:
+    """Hash canonical JSON after excluding the top-level content_hash field."""
+    if isinstance(value, BaseModel):
+        document = value.model_dump(mode="json")
+    else:
+        document = dict(value)
+    document.pop("content_hash", None)
+    encoded = json.dumps(
+        document,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
 class ManifestStore:

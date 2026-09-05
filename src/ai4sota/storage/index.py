@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 from contextlib import closing
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -62,23 +62,19 @@ class ResearchIndex:
         )
 
     def _scan_project(self, connection: sqlite3.Connection, root: Path) -> None:
+        resolved_root = root.resolve()
         for path in sorted(root.rglob("*")):
-            if not path.is_file() or self._is_ignored(path, root):
+            if not path.is_file() or not _resolves_inside(path, resolved_root):
                 continue
             relative = path.relative_to(root).as_posix()
-            if path.suffix.lower() == ".jsonl":
+            if _is_authoritative_event(relative):
                 self._insert_events(connection, relative, path)
-            elif path.suffix.lower() in {".yaml", ".yml", ".json"}:
+                continue
+            record_type = _authoritative_record_type(relative)
+            if record_type is not None:
                 value = self._load_mapping(path)
                 if value is not None:
-                    self._insert_record(connection, relative, value)
-
-    @staticmethod
-    def _is_ignored(path: Path, root: Path) -> bool:
-        relative = path.relative_to(root)
-        if relative.parts and relative.parts[0] in {".ai4sota", ".git"}:
-            return True
-        return path.suffix.lower() in {".bak", ".tmp"}
+                    self._insert_record(connection, relative, record_type, value)
 
     @staticmethod
     def _load_mapping(path: Path) -> dict[str, Any] | None:
@@ -93,6 +89,7 @@ class ResearchIndex:
     def _insert_record(
         connection: sqlite3.Connection,
         relative: str,
+        record_type: str,
         value: dict[str, Any],
     ) -> None:
         connection.execute(
@@ -103,7 +100,7 @@ class ResearchIndex:
             """,
             (
                 relative,
-                _record_type(relative),
+                record_type,
                 value.get("id"),
                 value.get("api_version"),
                 value.get("content_hash"),
@@ -146,18 +143,50 @@ class ResearchIndex:
             temporary.with_name(temporary.name + suffix).unlink(missing_ok=True)
 
 
-def _record_type(relative: str) -> str:
-    parts = Path(relative).parts
+def _resolves_inside(path: Path, resolved_root: Path) -> bool:
+    try:
+        return path.resolve().is_relative_to(resolved_root)
+    except OSError:
+        return False
+
+
+def _authoritative_record_type(relative: str) -> str | None:
+    parts = PurePosixPath(relative).parts
+    suffix = PurePosixPath(relative).suffix.lower()
+    if suffix not in {".yaml", ".yml", ".json"}:
+        return None
     if relative == "ai4sota.project.yaml":
         return "project"
-    if parts and parts[0] == "runs" and Path(relative).name == "manifest.yaml":
-        return "run"
-    if parts and parts[0] == "research-commits":
-        return "research_commit"
-    if parts and parts[0] == "decisions":
-        return "decision"
-    if parts and parts[0] == "tasks":
+    if relative == "tasks/active.yaml":
         return "task"
-    if len(parts) >= 2 and parts[0] == "modules":
+    if (
+        len(parts) >= 4
+        and parts[0] == "modules"
+        and parts[1] in {"data", "method", "evaluation"}
+        and parts[2] == "current"
+    ):
         return f"{parts[1]}_module"
-    return "manifest"
+    if len(parts) >= 3 and parts[:2] == ("data", "fingerprints"):
+        return "data_fingerprint"
+    if len(parts) >= 3 and parts[:2] == ("data", "splits"):
+        return "split"
+    if len(parts) >= 2 and parts[0] == "decisions":
+        return "decision"
+    if len(parts) >= 2 and parts[0] == "references":
+        return "reference"
+    if len(parts) == 3 and parts[0] == "runs" and parts[2] == "manifest.yaml":
+        return "run"
+    if (
+        len(parts) == 3
+        and parts[0] == "research-commits"
+        and parts[2] in {"manifest.yaml", "artifact-index.json"}
+    ):
+        return "research_commit"
+    return None
+
+
+def _is_authoritative_event(relative: str) -> bool:
+    parts = PurePosixPath(relative).parts
+    return relative == "conversations/events.jsonl" or (
+        len(parts) == 3 and parts[0] == "runs" and parts[2] == "events.jsonl"
+    )

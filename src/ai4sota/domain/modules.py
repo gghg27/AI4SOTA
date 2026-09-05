@@ -111,6 +111,7 @@ class MetricSpec(StrictModel):
 class SplitProtocolSpec(StrictModel):
     kind: NonEmptyStr
     group_by: NonEmptyStr
+    evaluate_split: NonEmptyStr | None = None
     test_fraction: PositiveFloat | None = None
     folds: int | None = None
     repeats: int = 1

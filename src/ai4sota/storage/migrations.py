@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,8 +13,13 @@ from typing import Any
 import yaml  # type: ignore[import-untyped]
 
 from .atomic import atomic_write_bytes
+from .manifests import canonical_manifest_hash
 
 Migration = Callable[[dict[str, Any], str], dict[str, Any]]
+PHASE1_TASK_CONTRACT_HASH = (
+    "sha256:bdc75a386dfae7886c01e32d6bb88a04"
+    "e165901ca15ff570375db1b36d84a324"
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +48,7 @@ def plan_schema_migration(path: Path, target: str) -> MigrationPlan:
         raise ValueError(f"no registered schema migration for {key}") from error
     original_hash = _sha256(original)
     migrated = migration(value, original_hash)
+    migrated["content_hash"] = canonical_manifest_hash(migrated)
     migrated_bytes = yaml.safe_dump(
         migrated, allow_unicode=True, sort_keys=False
     ).encode("utf-8")
@@ -73,12 +80,22 @@ def apply_schema_migration(plan: MigrationPlan, expected_hash: str) -> Path:
         raise ValueError("manifest hash changed after migration preview")
     digest = plan.original_hash.removeprefix("sha256:")
     backup = plan.path.with_name(f"{plan.path.name}.{digest}.bak")
-    if backup.exists() and backup.read_bytes() != plan.original_bytes:
-        raise FileExistsError(f"migration backup has unexpected content: {backup}")
-    if not backup.exists():
-        atomic_write_bytes(backup, plan.original_bytes)
+    _create_or_verify_backup(backup, plan.original_bytes)
     atomic_write_bytes(plan.path, plan.migrated_bytes)
     return backup
+
+
+def _create_or_verify_backup(path: Path, data: bytes) -> None:
+    try:
+        with path.open("xb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except FileExistsError:
+        if path.read_bytes() != data:
+            raise FileExistsError(
+                f"migration backup has unexpected content: {path}"
+            ) from None
 
 
 def _sha256(value: bytes) -> str:
@@ -103,13 +120,13 @@ def _slug(value: object, fallback: str) -> str:
     return text or fallback
 
 
-def _project_migration(value: dict[str, Any], content_hash: str) -> dict[str, Any]:
+def _project_migration(value: dict[str, Any], legacy_hash: str) -> dict[str, Any]:
+    del legacy_hash
     name = str(value.get("name") or "project")
     return {
         "api_version": "ai4sota/v1",
         "id": f"project/{_slug(name, 'project')}",
         "version": "1.0.0",
-        "content_hash": content_hash,
         "name": name,
         "active_task": "tasks/active.yaml",
         "active_modules": {
@@ -120,7 +137,7 @@ def _project_migration(value: dict[str, Any], content_hash: str) -> dict[str, An
     }
 
 
-def _data_migration(value: dict[str, Any], content_hash: str) -> dict[str, Any]:
+def _data_migration(value: dict[str, Any], legacy_hash: str) -> dict[str, Any]:
     source = value.get("source")
     source = source if isinstance(source, dict) else {}
     fields = value.get("fields")
@@ -129,35 +146,33 @@ def _data_migration(value: dict[str, Any], content_hash: str) -> dict[str, Any]:
     for group in ("inputs", "targets", "metadata"):
         mapping = fields.get(group)
         if isinstance(mapping, dict):
-            outputs.extend(str(item) for item in mapping.values())
+            outputs.extend(str(item) for item in mapping)
     source_path = str(source.get("path") or "dataset")
     return {
         "api_version": "ai4sota/v1",
         "id": f"data/{_slug(Path(source_path).stem, 'dataset')}",
         "version": "1.0.0",
-        "content_hash": content_hash,
         "kind": "data",
-        "origin": {"type": "project"},
+        "origin": {"type": "project", "based_on": legacy_hash},
         "source": "source.yaml",
         "preprocessing": "preprocessing.yaml",
         "entrypoint": "adapter:load",
         "canonical_outputs": list(dict.fromkeys(outputs)) or ["features", "label"],
         "task_contract": "tasks/active.yaml",
-        "task_contract_hash": content_hash,
+        "task_contract_hash": PHASE1_TASK_CONTRACT_HASH,
         "validation_commands": [],
     }
 
 
-def _method_migration(value: dict[str, Any], content_hash: str) -> dict[str, Any]:
+def _method_migration(value: dict[str, Any], legacy_hash: str) -> dict[str, Any]:
     name = str(value.get("name") or "method")
     recipe_keys = ("learning_rate", "epochs", "l2")
     return {
         "api_version": "ai4sota/v1",
         "id": f"method/{_slug(name, 'method')}",
         "version": "1.0.0",
-        "content_hash": content_hash,
         "kind": "method",
-        "origin": {"type": "project"},
+        "origin": {"type": "project", "based_on": legacy_hash},
         "framework": "numpy",
         "entrypoint": "model:fit_predict",
         "input_requirements": {
@@ -171,7 +186,7 @@ def _method_migration(value: dict[str, Any], content_hash: str) -> dict[str, Any
 
 
 def _evaluation_migration(
-    value: dict[str, Any], content_hash: str
+    value: dict[str, Any], legacy_hash: str
 ) -> dict[str, Any]:
     prediction_key = str(value.get("prediction_key") or "label")
     split_key = str(value.get("split_key") or "split")
@@ -179,15 +194,18 @@ def _evaluation_migration(
         "api_version": "ai4sota/v1",
         "id": "evaluation/phase1",
         "version": "1.0.0",
-        "content_hash": content_hash,
         "kind": "evaluation",
-        "origin": {"type": "project"},
+        "origin": {"type": "project", "based_on": legacy_hash},
         "entrypoint": "evaluator:evaluate",
         "task_contract": "tasks/active.yaml",
-        "task_contract_hash": content_hash,
+        "task_contract_hash": PHASE1_TASK_CONTRACT_HASH,
         "required_predictions": [prediction_key],
         "required_metadata": [split_key],
-        "protocol": {"kind": "declared_split", "group_by": split_key},
+        "protocol": {
+            "kind": "declared_split",
+            "group_by": split_key,
+            "evaluate_split": str(value.get("evaluate_split") or "test"),
+        },
         "metrics": [
             {
                 "name": "accuracy",
