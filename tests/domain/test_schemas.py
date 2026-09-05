@@ -22,10 +22,12 @@ from ai4sota.domain.modules import (
 from ai4sota.domain.projects import ProjectSpec
 from ai4sota.domain.task import TaskContract
 
+CONTENT_HASH = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 DATA_MODULE_FIXTURE = {
     "id": "data/seed",
     "version": "1.0.0",
-    "content_hash": "sha256:data-module",
+    "content_hash": CONTENT_HASH,
     "origin": {
         "type": "project",
         "based_on": "data/seed@0.4.0",
@@ -36,9 +38,45 @@ DATA_MODULE_FIXTURE = {
     "entrypoint": "adapter:load",
     "canonical_outputs": ["signal", "label", "subject_id"],
     "task_contract": "tasks/emotion.yaml",
-    "task_contract_hash": "sha256:task",
+    "task_contract_hash": CONTENT_HASH,
     "validation_commands": ["pytest tests/data -q"],
 }
+
+
+@pytest.mark.parametrize(
+    "content_hash",
+    [
+        "sha256:",
+        "sha256:not-a-hex-digest",
+        "sha256:" + "a" * 63,
+    ],
+)
+def test_content_hash_rejects_noncanonical_sha256_digests(content_hash: str) -> None:
+    """Catches malformed content addresses being persisted as scientific provenance."""
+    with pytest.raises(ValidationError):
+        TaskContract(
+            id="task/emotion",
+            content_hash=content_hash,
+            prediction_unit="trial",
+            target_type="multiclass",
+            classes={"negative": 0, "neutral": 1},
+            required_metadata=["subject_id"],
+        )
+
+
+def test_decision_record_rejects_a_selection_absent_from_options() -> None:
+    """Catches a confirmed decision whose stored answer was never an offered choice."""
+    with pytest.raises(ValidationError):
+        DecisionRecord(
+            id="decision/subject-split",
+            content_hash=CONTENT_HASH,
+            scope="evaluation",
+            question="Which subject-safe split should be used?",
+            options=["group holdout", "group k-fold"],
+            selected_option="random holdout",
+            confirmed_by="researcher",
+            confirmed_content_hashes=[CONTENT_HASH],
+        )
 
 
 def test_task_contract_rejects_duplicate_class_codes() -> None:
@@ -46,7 +84,7 @@ def test_task_contract_rejects_duplicate_class_codes() -> None:
     with pytest.raises(ValidationError):
         TaskContract(
             id="task/emotion",
-            content_hash="sha256:task",
+            content_hash=CONTENT_HASH,
             prediction_unit="trial",
             target_type="multiclass",
             classes={"negative": 0, "neutral": 0},
@@ -67,7 +105,7 @@ def test_project_contract_rejects_unknown_persisted_fields() -> None:
     with pytest.raises(ValidationError):
         ProjectSpec(
             id="project/seed-emotion",
-            content_hash="sha256:project",
+            content_hash=CONTENT_HASH,
             name="Seed emotion",
             active_modules={
                 "data": "modules/data/current",
@@ -83,12 +121,12 @@ def test_source_rejects_a_non_positive_sampling_rate() -> None:
     with pytest.raises(ValidationError):
         DatasetSourceSpec(
             id="source/seed",
-            content_hash="sha256:source",
+            content_hash=CONTENT_HASH,
             name="Seed EEG",
             locations=["data/seed.edf"],
             sampling_rate_hz=0,
             metadata_fields=["subject_id"],
-            fingerprint_hash="sha256:fingerprint",
+            fingerprint_hash=CONTENT_HASH,
         )
 
 
@@ -98,7 +136,7 @@ def test_module_entrypoints_and_metric_ownership_are_enforced() -> None:
         MethodSpec(
             id="method/baseline",
             version="1.0.0",
-            content_hash="sha256:method",
+            content_hash=CONTENT_HASH,
             origin={"type": "project", "remote_source": None},
             framework="numpy",
             entrypoint="",
@@ -109,11 +147,11 @@ def test_module_entrypoints_and_metric_ownership_are_enforced() -> None:
         EvaluationSpec(
             id="evaluation/subject-holdout",
             version="1.0.0",
-            content_hash="sha256:evaluation",
+            content_hash=CONTENT_HASH,
             origin={"type": "project", "remote_source": None},
             entrypoint="evaluate:run",
             task_contract="tasks/emotion.yaml",
-            task_contract_hash="sha256:task",
+            task_contract_hash=CONTENT_HASH,
             required_predictions=["logits"],
             protocol={"kind": "group_holdout", "group_by": "subject_id"},
             metrics=[
@@ -127,14 +165,14 @@ def test_ledger_manifests_round_trip_exact_content_addresses() -> None:
     """Catches snapshots that lose their hash-bound scientific provenance."""
     preprocessing = PreprocessingSpec(
         id="preprocessing/seed",
-        content_hash="sha256:preprocessing",
+        content_hash=CONTENT_HASH,
         transforms=[{"name": "bandpass", "parameters": {"low_hz": 1, "high_hz": 40}}],
-        graph_hash="sha256:graph",
+        graph_hash=CONTENT_HASH,
     )
     split = SplitManifest(
         id="split/run-001",
-        content_hash="sha256:split",
-        evaluation_hash="sha256:evaluation",
+        content_hash=CONTENT_HASH,
+        evaluation_hash=CONTENT_HASH,
         seed=17,
         group_by="subject_id",
         members=[
@@ -144,32 +182,32 @@ def test_ledger_manifests_round_trip_exact_content_addresses() -> None:
     )
     experiment = ExperimentSpec(
         id="experiment/run-001",
-        content_hash="sha256:experiment",
+        content_hash=CONTENT_HASH,
         project_id="project/seed-emotion",
-        data_module_hash="sha256:data-module",
-        method_module_hash="sha256:method",
-        evaluation_module_hash="sha256:evaluation",
-        task_contract_hash="sha256:task",
-        data_fingerprint_hash="sha256:fingerprint",
+        data_module_hash=CONTENT_HASH,
+        method_module_hash=CONTENT_HASH,
+        evaluation_module_hash=CONTENT_HASH,
+        task_contract_hash=CONTENT_HASH,
+        data_fingerprint_hash=CONTENT_HASH,
         split_manifest_hash=split.content_hash,
         seed=17,
     )
     run = RunManifest(
         id="run/001",
-        content_hash="sha256:run",
+        content_hash=CONTENT_HASH,
         project_id="project/seed-emotion",
         experiment_hash=experiment.content_hash,
-        snapshot_hash="sha256:snapshot",
-        data_fingerprint_hash="sha256:fingerprint",
-        task_contract_hash="sha256:task",
+        snapshot_hash=CONTENT_HASH,
+        data_fingerprint_hash=CONTENT_HASH,
+        task_contract_hash=CONTENT_HASH,
         split_manifest_hash=split.content_hash,
-        evaluation_protocol_hash="sha256:protocol",
-        metric_implementation_hash="sha256:metrics",
+        evaluation_protocol_hash=CONTENT_HASH,
+        metric_implementation_hash=CONTENT_HASH,
         integrity_state="verified",
     )
     commit = ResearchCommitManifest(
         id="research-commit/001",
-        content_hash="sha256:commit",
+        content_hash=CONTENT_HASH,
         project_id="project/seed-emotion",
         run_ids=[run.id],
         run_manifest_hashes=[run.content_hash],
@@ -178,7 +216,7 @@ def test_ledger_manifests_round_trip_exact_content_addresses() -> None:
     )
     decision = DecisionRecord(
         id="decision/subject-split",
-        content_hash="sha256:decision",
+        content_hash=CONTENT_HASH,
         scope="evaluation",
         question="Which subject-safe split should be used?",
         options=["group holdout", "group k-fold"],
@@ -189,6 +227,6 @@ def test_ledger_manifests_round_trip_exact_content_addresses() -> None:
 
     assert preprocessing.api_version == "ai4sota/v1"
     assert SplitManifest.model_validate(split.model_dump()).members[1].partition == "test"
-    assert RunManifest.model_validate(run.model_dump()).snapshot_hash == "sha256:snapshot"
+    assert RunManifest.model_validate(run.model_dump()).snapshot_hash == CONTENT_HASH
     assert ResearchCommitManifest.model_validate(commit.model_dump()).run_ids == ("run/001",)
     assert DecisionRecord.model_validate(decision.model_dump()).scope.value == "evaluation"

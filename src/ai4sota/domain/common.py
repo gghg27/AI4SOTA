@@ -9,7 +9,13 @@ from pydantic import BaseModel, ConfigDict, StringConstraints
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 ContentHash = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, pattern=r"^sha256:")
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=71,
+        max_length=71,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    ),
 ]
 
 

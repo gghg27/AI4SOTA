@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 from .common import (
     ContentHash,
@@ -33,3 +33,9 @@ class DecisionRecord(SchemaHeader):
     ) -> tuple[str, ...]:
         field_name = getattr(info, "field_name", "decision values")
         return require_non_empty_items(value, field_name)
+
+    @model_validator(mode="after")
+    def selection_is_an_offered_option(self) -> DecisionRecord:
+        if self.selected_option not in self.options:
+            raise ValueError("selected_option must be one of options")
+        return self
