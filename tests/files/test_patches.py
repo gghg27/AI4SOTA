@@ -102,6 +102,74 @@ def test_duplicate_canonical_targets_fail_before_hashing_or_writing(
     assert target.read_text(encoding="utf-8") == "old"
 
 
+def test_traversal_segment_is_rejected_before_hashing_or_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches an in-root traversal spelling reaching the hash or write phases."""
+    target = write(tmp_path / "a.py", "old")
+    patch = PatchSet(
+        targets=[
+            PatchTarget(
+                path="sub/../a.py",
+                expected_sha256="sha256:" + "0" * 64,
+                content="new",
+            )
+        ]
+    )
+
+    def hash_must_not_run(path: Path) -> str:
+        pytest.fail(f"traversal target reached hash check: {path}")
+
+    monkeypatch.setattr(patches_module, "sha256_file", hash_must_not_run)
+
+    with pytest.raises(PatchValidationError, match="traversal"):
+        apply_patch_set(tmp_path, patch)
+
+    assert target.read_text(encoding="utf-8") == "old"
+
+
+def test_normalized_filename_aliases_are_rejected_before_hashing_or_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches distinct target spellings whose filesystem identities coincide."""
+    target = write(tmp_path / "a.py", "old")
+    aliases = ("a.py.", "a.py ")
+    alias = next(
+        (
+            value
+            for value in aliases
+            if (tmp_path / value).resolve(strict=False) == target.resolve()
+        ),
+        None,
+    )
+    if alias is None:
+        pytest.skip("filesystem does not expose a safe normalized filename alias")
+    patch = PatchSet(
+        targets=[
+            PatchTarget(
+                path="a.py",
+                expected_sha256="sha256:" + "0" * 64,
+                content="first",
+            ),
+            PatchTarget(
+                path=alias,
+                expected_sha256="sha256:" + "0" * 64,
+                content="second",
+            ),
+        ]
+    )
+
+    def hash_must_not_run(path: Path) -> str:
+        pytest.fail(f"canonical duplicate reached hash check: {path}")
+
+    monkeypatch.setattr(patches_module, "sha256_file", hash_must_not_run)
+
+    with pytest.raises(PatchValidationError, match="duplicate"):
+        apply_patch_set(tmp_path, patch)
+
+    assert target.read_text(encoding="utf-8") == "old"
+
+
 def test_regular_file_project_root_is_rejected_before_path_operations(
     tmp_path: Path,
 ) -> None:

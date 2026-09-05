@@ -49,6 +49,14 @@ class PatchValidationError(ValueError):
     """Raised when a patch request is invalid before file access is safe."""
 
 
+@dataclass(frozen=True)
+class _ResolvedTarget:
+    """A safe lexical replacement path paired with its canonical identity."""
+
+    path: Path
+    identity: Path
+
+
 def apply_patch_set(project_root: Path, patch_set: PatchSet) -> AppliedPatch:
     """Replace all patch targets only when every expected hash still matches."""
     targets = tuple(patch_set.targets)
@@ -58,14 +66,14 @@ def apply_patch_set(project_root: Path, patch_set: PatchSet) -> AppliedPatch:
     _reject_duplicate_paths(resolved)
     conflicts = tuple(
         target.path
-        for target, path in zip(targets, resolved, strict=True)
-        if _is_conflicted(path, target.expected_sha256)
+        for target, resolved_target in zip(targets, resolved, strict=True)
+        if _is_conflicted(resolved_target.path, target.expected_sha256)
     )
     if conflicts:
         raise PatchConflict(conflicts)
 
-    for target, path in zip(targets, resolved, strict=True):
-        atomic_write_bytes(path, target.content.encode("utf-8"))
+    for target, resolved_target in zip(targets, resolved, strict=True):
+        atomic_write_bytes(resolved_target.path, target.content.encode("utf-8"))
     return AppliedPatch(paths=tuple(target.path for target in targets))
 
 
@@ -95,10 +103,14 @@ def _is_conflicted(path: Path, expected_sha256: str) -> bool:
         return True
 
 
-def _resolve_inside(root: Path, relative_path: str) -> Path:
+def _resolve_inside(root: Path, relative_path: str) -> _ResolvedTarget:
     target = Path(relative_path)
     if target.is_absolute() or target.drive:
         raise PatchValidationError(f"patch path must be relative: {relative_path}")
+    if ".." in target.parts:
+        raise PatchValidationError(
+            f"patch path escapes project root through traversal: {relative_path}"
+        )
 
     candidate = root / target
     resolved = candidate.resolve(strict=False)
@@ -110,12 +122,12 @@ def _resolve_inside(root: Path, relative_path: str) -> Path:
         ) from error
     if resolved == root:
         raise PatchValidationError(f"patch path cannot be the project root: {relative_path}")
-    return candidate
+    return _ResolvedTarget(path=candidate, identity=resolved)
 
 
-def _reject_duplicate_paths(paths: Sequence[Path]) -> None:
+def _reject_duplicate_paths(paths: Sequence[_ResolvedTarget]) -> None:
     seen: set[Path] = set()
     for path in paths:
-        if path in seen:
-            raise PatchValidationError(f"duplicate patch target: {path}")
-        seen.add(path)
+        if path.identity in seen:
+            raise PatchValidationError(f"duplicate patch target: {path.identity}")
+        seen.add(path.identity)
