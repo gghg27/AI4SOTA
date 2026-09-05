@@ -1,0 +1,31 @@
+{
+  "run_id": "20260823_092905",
+  "status": "success",
+  "note": "第二次基线实验",
+  "started_at": "2026-08-23T09:29:05+00:00",
+  "finished_at": "2026-08-23T09:29:05+00:00",
+  "data_fingerprint": "sha256:c1d7f4fc8c3c60d86e727827ea830f5a90a5a3876cc56d3eae85074fa128ca82",
+  "metrics": {
+    "accuracy": 0.8666666666666667,
+    "macro_f1": 0.8653198653198653
+  },
+  "prediction_report": {
+    "sample_count": 240,
+    "shapes": {
+      "label": [
+        240
+      ],
+      "positive_probability": [
+        240
+      ]
+    }
+  },
+  "evaluation_report": {
+    "metric_names": [
+      "accuracy",
+      "macro_f1"
+    ],
+    "warning_count": 0
+  },
+  "source_revision": "unversioned-phase1"
+}

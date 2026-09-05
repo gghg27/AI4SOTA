@@ -1,0 +1,60 @@
+{
+  "sample_count": 240,
+  "shapes": {
+    "inputs": {
+      "features": [
+        240,
+        8
+      ]
+    },
+    "targets": {
+      "label": [
+        240
+      ]
+    },
+    "metadata": {
+      "split": [
+        240
+      ]
+    }
+  },
+  "schema": {
+    "input_axes": [
+      "sample",
+      "feature"
+    ],
+    "task": "binary_classification"
+  },
+  "status": "valid",
+  "data_path": "B:\\AI4SOTA\\AI4SOTA-MVP-Phase1\\workspaces\\demo\\demo_data\\demo.npz",
+  "data_fingerprint": "sha256:c1d7f4fc8c3c60d86e727827ea830f5a90a5a3876cc56d3eae85074fa128ca82",
+  "labels": {
+    "0": 120,
+    "1": 120
+  },
+  "splits": {
+    "test": 60,
+    "train": 180
+  },
+  "configs": {
+    "method": {
+      "name": "numpy_logistic_regression",
+      "input_key": "features",
+      "target_key": "label",
+      "split_key": "split",
+      "learning_rate": 0.15,
+      "epochs": 800,
+      "l2": 0.001
+    },
+    "evaluation": {
+      "target_key": "label",
+      "prediction_key": "label",
+      "split_key": "split",
+      "evaluate_split": "test"
+    },
+    "run": {
+      "run_name": "baseline",
+      "random_seed": 42
+    }
+  }
+}
