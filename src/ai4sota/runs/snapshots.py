@@ -213,6 +213,7 @@ def prepare_run(project: ProjectLayout, experiment: ExperimentSpec) -> RunManife
             metric_implementation_hash=metric_hash,
             integrity_state="verified",
             status="queued",
+            seed=experiment.seed,
         )
         manifest = draft.model_copy(
             update={"content_hash": canonical_manifest_hash(draft)}

@@ -92,6 +92,9 @@ class RunManifest(SchemaHeader):
     status: NonEmptyStr = "draft"
     metrics: dict[NonEmptyStr, float] = Field(default_factory=dict)
     parent_research_commit: NonEmptyStr | None = None
+    seed: int | None = None
+    fold: int | None = None
+    repeat: int | None = None
 
 
 class ResearchCommitManifest(SchemaHeader):

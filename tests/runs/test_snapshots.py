@@ -15,6 +15,7 @@ from ai4sota.domain import (
     MethodSpec,
     ModuleKind,
     ProjectSpec,
+    RunManifest,
     SplitManifest,
 )
 from ai4sota.files.hashing import sha256_file
@@ -438,3 +439,17 @@ def test_prepare_run_uses_durable_directory_publication(
     assert calls == [
         (project.index_file.parent / manifest.id, project.runs_dir / manifest.id)
     ]
+
+
+def test_prepare_run_persists_the_approved_repetition_seed(
+    runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
+) -> None:
+    """Catches aggregation coordinates being lost when an approved Run is frozen."""
+    project, experiment, _ = runnable_project
+
+    manifest = prepare_run(project, experiment)
+
+    assert manifest.seed == 17
+    assert ManifestStore().read(
+        project.runs_dir / manifest.id / "manifest.yaml", RunManifest
+    ).seed == 17

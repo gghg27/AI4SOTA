@@ -51,6 +51,40 @@ def make_run(run_dir: Path, status: str = "draft") -> RunManifest:
     return manifest
 
 
+def test_legacy_manifest_without_repetition_coordinates_keeps_its_hash(
+    tmp_path: Path,
+) -> None:
+    """Catches optional aggregation coordinates invalidating existing Run evidence."""
+    run_dir = tmp_path / "run-legacy"
+    run_dir.mkdir()
+    document: dict[str, object] = {
+        "api_version": "ai4sota/v1",
+        "id": "run-legacy",
+        "version": "1.0.0",
+        "content_hash": CONTENT_HASH,
+        "project_id": "project/seed-emotion",
+        "experiment_hash": CONTENT_HASH,
+        "snapshot_hash": CONTENT_HASH,
+        "data_fingerprint_hash": CONTENT_HASH,
+        "task_contract_hash": CONTENT_HASH,
+        "split_manifest_hash": CONTENT_HASH,
+        "evaluation_protocol_hash": CONTENT_HASH,
+        "metric_implementation_hash": CONTENT_HASH,
+        "integrity_state": "verified",
+        "status": "succeeded",
+        "metrics": {"macro_f1": 0.8},
+        "parent_research_commit": None,
+    }
+    document["content_hash"] = canonical_manifest_hash(document)
+    ManifestStore().write(run_dir / "manifest.yaml", document)
+
+    manifest = load_run_manifest(run_dir)
+
+    assert manifest.seed is None
+    assert manifest.fold is None
+    assert manifest.repeat is None
+
+
 def write_transition_event(
     run_dir: Path,
     current: RunManifest,

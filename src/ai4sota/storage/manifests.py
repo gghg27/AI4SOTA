@@ -11,6 +11,8 @@ from typing import Any, TypeVar
 import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel
 
+from ai4sota.domain import RunManifest
+
 from .atomic import atomic_write_bytes
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -20,6 +22,10 @@ def canonical_manifest_hash(value: BaseModel | Mapping[str, Any]) -> str:
     """Hash canonical JSON after excluding the top-level content_hash field."""
     if isinstance(value, BaseModel):
         document = value.model_dump(mode="json")
+        if isinstance(value, RunManifest):
+            for field in ("seed", "fold", "repeat"):
+                if document.get(field) is None:
+                    document.pop(field, None)
     else:
         document = dict(value)
     document.pop("content_hash", None)
