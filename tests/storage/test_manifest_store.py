@@ -9,7 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 import ai4sota.storage.atomic as atomic_module
-from ai4sota.domain import TaskContract
+from ai4sota.domain import RunManifest, TaskContract
 from ai4sota.storage import (
     ManifestStore,
     atomic_write_bytes,
@@ -47,6 +47,25 @@ def test_canonical_manifest_hash_is_ordered_and_excludes_its_own_field() -> None
         "sha256:b1b69890623096f383947d46632cf21b723d41b44cc86d766956c40fa492f0d0"
     )
     assert canonical_manifest_hash(second) == canonical_manifest_hash(first)
+
+
+def test_run_manifest_hash_normalizes_absent_repetition_coordinates_consistently() -> None:
+    """Catches equivalent Run models and mappings receiving different hashes."""
+    run = RunManifest(
+        id="run-001",
+        content_hash=CONTENT_HASH,
+        project_id="project/seed-emotion",
+        experiment_hash=CONTENT_HASH,
+        snapshot_hash=CONTENT_HASH,
+        data_fingerprint_hash=CONTENT_HASH,
+        task_contract_hash=CONTENT_HASH,
+        split_manifest_hash=CONTENT_HASH,
+        evaluation_protocol_hash=CONTENT_HASH,
+        metric_implementation_hash=CONTENT_HASH,
+        integrity_state="verified",
+    )
+
+    assert canonical_manifest_hash(run) == canonical_manifest_hash(run.model_dump())
 
 
 def test_manifest_write_is_readable_and_leaves_no_temp_file(tmp_path: Path) -> None:

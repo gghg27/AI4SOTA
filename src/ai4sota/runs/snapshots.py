@@ -67,10 +67,18 @@ def hash_tree(root: Path) -> str:
     return canonical_manifest_hash({"files": document})
 
 
-def prepare_run(project: ProjectLayout, experiment: ExperimentSpec) -> RunManifest:
+def prepare_run(
+    project: ProjectLayout,
+    experiment: ExperimentSpec,
+    *,
+    repetition_seed: int | None = None,
+) -> RunManifest:
     """Verify approved inputs and atomically publish an executable Run snapshot."""
     if experiment.approval_id is None:
         raise SnapshotValidationError("experiment must have an approval identifier")
+    run_seed = experiment.seed if repetition_seed is None else repetition_seed
+    if isinstance(run_seed, bool) or not isinstance(run_seed, int):
+        raise SnapshotValidationError("repetition seed must be an integer")
     _verify_model_hash(experiment, "experiment")
 
     project_file = _read_file(project.project_file, "project manifest")
@@ -213,7 +221,7 @@ def prepare_run(project: ProjectLayout, experiment: ExperimentSpec) -> RunManife
             metric_implementation_hash=metric_hash,
             integrity_state="verified",
             status="queued",
-            seed=experiment.seed,
+            seed=run_seed,
         )
         manifest = draft.model_copy(
             update={"content_hash": canonical_manifest_hash(draft)}
@@ -228,7 +236,10 @@ def prepare_run(project: ProjectLayout, experiment: ExperimentSpec) -> RunManife
                 run_id=run_id,
                 event_type="run_prepared",
                 status="queued",
-                details={"approval_id": experiment.approval_id},
+                details={
+                    "approval_id": experiment.approval_id,
+                    "repetition_coordinates": {"seed": run_seed},
+                },
             ),
         )
         _verify_external_fingerprint(source, experiment.data_fingerprint_hash)

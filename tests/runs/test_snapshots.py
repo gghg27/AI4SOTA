@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import TypeVar
 
@@ -20,7 +21,12 @@ from ai4sota.domain import (
 )
 from ai4sota.files.hashing import sha256_file
 from ai4sota.projects import ProjectLayout
-from ai4sota.runs import SnapshotValidationError, hash_tree, prepare_run
+from ai4sota.runs import (
+    SnapshotValidationError,
+    aggregate_runs,
+    hash_tree,
+    prepare_run,
+)
 from ai4sota.storage import ManifestStore, canonical_manifest_hash
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
@@ -453,3 +459,43 @@ def test_prepare_run_persists_the_approved_repetition_seed(
     assert ManifestStore().read(
         project.runs_dir / manifest.id / "manifest.yaml", RunManifest
     ).seed == 17
+
+
+def test_prepared_run_repetition_seeds_aggregate_without_changing_the_snapshot(
+    runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
+) -> None:
+    """Catches seed repetitions altering the immutable approved input snapshot."""
+    project, experiment, _ = runnable_project
+
+    first = prepare_run(project, experiment, repetition_seed=7)
+    second = prepare_run(project, experiment, repetition_seed=17)
+    completed = [
+        _completed_run(first, macro_f1=0.8),
+        _completed_run(second, macro_f1=0.82),
+    ]
+
+    result = aggregate_runs(completed, dimensions={"seed"})
+
+    assert first.snapshot_hash == second.snapshot_hash
+    assert first.experiment_hash == second.experiment_hash == experiment.content_hash
+    assert (first.seed, second.seed) == (7, 17)
+    assert ManifestStore().read(
+        project.runs_dir / first.id / "manifest.yaml", RunManifest
+    ).seed == 7
+    first_event = json.loads(
+        (project.runs_dir / first.id / "events.jsonl").read_text(encoding="utf-8")
+    )
+    assert first_event["details"]["approval_id"] == experiment.approval_id
+    assert first_event["details"]["repetition_coordinates"] == {"seed": 7}
+    assert result.metrics["macro_f1"].mean == pytest.approx(0.81)
+
+
+def _completed_run(manifest: RunManifest, *, macro_f1: float) -> RunManifest:
+    draft = manifest.model_copy(
+        update={
+            "content_hash": ZERO_HASH,
+            "status": "succeeded",
+            "metrics": {"macro_f1": macro_f1},
+        }
+    )
+    return draft.model_copy(update={"content_hash": canonical_manifest_hash(draft)})

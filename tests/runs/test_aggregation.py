@@ -98,3 +98,20 @@ def test_aggregation_rejects_incomplete_runs() -> None:
             [make_run("run-seed-7", seed=7), make_run("run-running", seed=17, status="running")],
             dimensions={"seed"},
         )
+
+
+def test_aggregation_rejects_duplicate_run_ids() -> None:
+    """Catches one completed Run being counted twice as independent evidence."""
+    repeated = make_run("run-seed-7", seed=7)
+
+    with pytest.raises(AggregationError, match="duplicate Run id"):
+        aggregate_runs([repeated, repeated], dimensions={"seed"})
+
+
+def test_aggregation_rejects_duplicate_repetition_coordinates() -> None:
+    """Catches distinct Run records double-counting one seed coordinate."""
+    with pytest.raises(AggregationError, match="duplicate repetition coordinates"):
+        aggregate_runs(
+            [make_run("run-seed-7a", seed=7), make_run("run-seed-7b", seed=7)],
+            dimensions={"seed"},
+        )

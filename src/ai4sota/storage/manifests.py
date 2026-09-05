@@ -16,18 +16,20 @@ from ai4sota.domain import RunManifest
 from .atomic import atomic_write_bytes
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+_REPETITION_FIELDS = frozenset({"seed", "fold", "repeat"})
+_RUN_MANIFEST_FIELDS = frozenset(RunManifest.model_fields) - _REPETITION_FIELDS
 
 
 def canonical_manifest_hash(value: BaseModel | Mapping[str, Any]) -> str:
     """Hash canonical JSON after excluding the top-level content_hash field."""
     if isinstance(value, BaseModel):
         document = value.model_dump(mode="json")
-        if isinstance(value, RunManifest):
-            for field in ("seed", "fold", "repeat"):
-                if document.get(field) is None:
-                    document.pop(field, None)
     else:
         document = dict(value)
+    if isinstance(value, RunManifest) or _is_run_manifest_document(document):
+        for field in _REPETITION_FIELDS:
+            if document.get(field) is None:
+                document.pop(field, None)
     document.pop("content_hash", None)
     encoded = json.dumps(
         document,
@@ -37,6 +39,10 @@ def canonical_manifest_hash(value: BaseModel | Mapping[str, Any]) -> str:
         sort_keys=True,
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _is_run_manifest_document(document: Mapping[str, Any]) -> bool:
+    return _RUN_MANIFEST_FIELDS.issubset(document)
 
 
 class ManifestStore:

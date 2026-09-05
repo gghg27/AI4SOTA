@@ -51,6 +51,16 @@ def aggregate_runs(
             raise AggregationError(
                 f"all aggregated Runs must declare {dimension!r} coordinates"
             )
+    run_ids = tuple(run.id for run in runs)
+    if len(set(run_ids)) != len(run_ids):
+        raise AggregationError("duplicate Run id in aggregation")
+    coordinate_names = tuple(sorted(declared))
+    coordinates = tuple(
+        tuple(getattr(run, dimension) for dimension in coordinate_names)
+        for run in runs
+    )
+    if len(set(coordinates)) != len(coordinates):
+        raise AggregationError("duplicate repetition coordinates in aggregation")
     if any(run.status != "succeeded" for run in runs):
         raise AggregationError("all aggregated Runs must have succeeded")
     _validate_metric_sets(runs)
