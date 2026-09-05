@@ -203,6 +203,7 @@ def test_ledger_manifests_round_trip_exact_content_addresses() -> None:
         data_fingerprint_hash=CONTENT_HASH,
         split_manifest_hash=split.content_hash,
         seed=17,
+        input_hashes={"modules/method/current/model.py": CONTENT_HASH},
     )
     run = RunManifest(
         id="run/001",
@@ -238,7 +239,46 @@ def test_ledger_manifests_round_trip_exact_content_addresses() -> None:
     )
 
     assert preprocessing.api_version == "ai4sota/v1"
-    assert SplitManifest.model_validate(split.model_dump()).members[1].partition == "test"
+    assert (
+        SplitManifest.model_validate(split.model_dump()).members[1].partition == "test"
+    )
+    assert experiment.input_hashes == {"modules/method/current/model.py": CONTENT_HASH}
     assert RunManifest.model_validate(run.model_dump()).snapshot_hash == CONTENT_HASH
-    assert ResearchCommitManifest.model_validate(commit.model_dump()).run_ids == ("run/001",)
-    assert DecisionRecord.model_validate(decision.model_dump()).scope.value == "evaluation"
+    assert ResearchCommitManifest.model_validate(commit.model_dump()).run_ids == (
+        "run/001",
+    )
+    assert (
+        DecisionRecord.model_validate(decision.model_dump()).scope.value == "evaluation"
+    )
+
+
+@pytest.mark.parametrize(
+    "input_hashes",
+    [
+        {},
+        {"/modules/method/current/model.py": CONTENT_HASH},
+        {"modules/method/current/../model.py": CONTENT_HASH},
+        {"modules\\method\\current\\model.py": CONTENT_HASH},
+        {"./modules/method/current/model.py": CONTENT_HASH},
+        {".": CONTENT_HASH},
+        {" modules/method/current/model.py ": CONTENT_HASH},
+    ],
+)
+def test_experiment_rejects_empty_or_noncanonical_input_paths(
+    input_hashes: dict[str, str],
+) -> None:
+    """Catches ambiguous or incomplete project input closures."""
+    with pytest.raises(ValidationError):
+        ExperimentSpec(
+            id="experiment/run-001",
+            content_hash=CONTENT_HASH,
+            project_id="project/seed-emotion",
+            data_module_hash=CONTENT_HASH,
+            method_module_hash=CONTENT_HASH,
+            evaluation_module_hash=CONTENT_HASH,
+            task_contract_hash=CONTENT_HASH,
+            data_fingerprint_hash=CONTENT_HASH,
+            split_manifest_hash=CONTENT_HASH,
+            seed=17,
+            input_hashes=input_hashes,
+        )

@@ -14,6 +14,7 @@ from ai4sota.storage import (
     ManifestStore,
     atomic_write_bytes,
     canonical_manifest_hash,
+    durable_replace,
 )
 
 CONTENT_HASH = "sha256:" + "a" * 64
@@ -43,8 +44,7 @@ def test_canonical_manifest_hash_is_ordered_and_excludes_its_own_field() -> None
     }
 
     assert canonical_manifest_hash(first) == (
-        "sha256:b1b69890623096f383947d46632cf21b"
-        "723d41b44cc86d766956c40fa492f0d0"
+        "sha256:b1b69890623096f383947d46632cf21b723d41b44cc86d766956c40fa492f0d0"
     )
     assert canonical_manifest_hash(second) == canonical_manifest_hash(first)
 
@@ -85,7 +85,9 @@ def test_manifest_read_rejects_unknown_persisted_fields(tmp_path: Path) -> None:
         ManifestStore().read(path, TaskContract)
 
 
-def test_atomic_write_replaces_existing_bytes_without_temp_files(tmp_path: Path) -> None:
+def test_atomic_write_replaces_existing_bytes_without_temp_files(
+    tmp_path: Path,
+) -> None:
     """Catches in-place replacement or successful writes leaving scratch files."""
     path = tmp_path / "nested" / "manifest.bin"
     path.parent.mkdir()
@@ -95,6 +97,22 @@ def test_atomic_write_replaces_existing_bytes_without_temp_files(tmp_path: Path)
 
     assert path.read_bytes() == b"new"
     assert list(path.parent.glob("*.tmp")) == []
+
+
+def test_durable_replace_publishes_a_complete_directory(tmp_path: Path) -> None:
+    """Catches Run publication bypassing durable replacement metadata."""
+    source = tmp_path / "staged-run"
+    destination = tmp_path / "runs" / "run-001"
+    source.mkdir()
+    (source / "manifest.yaml").write_text("status: queued\n", encoding="utf-8")
+    destination.parent.mkdir()
+
+    durable_replace(source, destination)
+
+    assert not source.exists()
+    assert (destination / "manifest.yaml").read_text(encoding="utf-8") == (
+        "status: queued\n"
+    )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows durability dispatch")

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+import ai4sota.runs.artifacts as artifacts_module
 from ai4sota.domain import RunManifest
 from ai4sota.files.hashing import sha256_file
 from ai4sota.runs import (
@@ -42,9 +44,7 @@ def completed_run(tmp_path: Path) -> Path:
         status="succeeded",
         metrics={"accuracy": 0.75},
     )
-    manifest = draft.model_copy(
-        update={"content_hash": canonical_manifest_hash(draft)}
-    )
+    manifest = draft.model_copy(update={"content_hash": canonical_manifest_hash(draft)})
     ManifestStore().write(run_dir / "manifest.yaml", manifest)
     return run_dir
 
@@ -72,9 +72,9 @@ def test_artifact_cleanup_keeps_scientific_record_and_writes_tombstone(
     assert record.items[0].sha256 == checkpoint_hash
     assert record.items[0].size_bytes == len(b"checkpoint payload")
     assert record.items[0].reason == "storage pressure"
-    assert "checkpoint.pt" in (
-        completed_run / "artifact-tombstones.jsonl"
-    ).read_text(encoding="utf-8")
+    assert "checkpoint.pt" in (completed_run / "artifact-tombstones.jsonl").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_cleanup_rechecks_manifest_hash_before_deleting_any_payload(
@@ -180,7 +180,7 @@ def test_cleanup_appends_tombstones_across_requests(completed_run: Path) -> None
 
     tombstones = (completed_run / "artifact-tombstones.jsonl").read_bytes()
     assert tombstones.startswith(prefix)
-    assert tombstones.count(b"\n") == 2
+    assert tombstones.count(b"\n") == 4
 
 
 def test_cleanup_records_successes_before_reporting_a_partial_failure(
@@ -214,7 +214,12 @@ def test_cleanup_records_successes_before_reporting_a_partial_failure(
         encoding="utf-8"
     )
     assert "first.pt" in tombstone
-    assert "second.pt" not in tombstone
+    second_entries = [
+        json.loads(line)
+        for line in tombstone.splitlines()
+        if json.loads(line)["item"]["path"] == "second.pt"
+    ]
+    assert [entry["phase"] for entry in second_entries] == ["intent"]
 
 
 def test_cleanup_records_prior_success_when_a_later_payload_changes(
@@ -286,3 +291,106 @@ def test_cleanup_rechecks_the_manifest_before_each_delete(
     assert not first.exists()
     assert second.exists()
     assert [item.path for item in captured.value.record.items] == ["first.pt"]
+
+
+def test_cleanup_rejects_a_non_file_tombstone_ledger_before_deletion(
+    completed_run: Path,
+) -> None:
+    """Catches ledger validation happening only after an irreversible unlink."""
+    payload = completed_run / "artifacts" / "checkpoint.pt"
+    payload.write_bytes(b"keep")
+    (completed_run / "artifact-tombstones.jsonl").mkdir()
+
+    with pytest.raises(ArtifactCleanupValidationError, match="ledger"):
+        cleanup_artifacts(
+            completed_run,
+            ["checkpoint.pt"],
+            expected_manifest_hash=manifest_hash(completed_run),
+        )
+
+    assert payload.read_bytes() == b"keep"
+
+
+def test_cleanup_intent_failure_reports_no_deleted_items(
+    completed_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches an unlink proceeding without a durable deletion intent."""
+    payload = completed_run / "artifacts" / "checkpoint.pt"
+    payload.write_bytes(b"keep")
+
+    def fail_intent(stream: object, entry: object) -> None:
+        raise OSError("injected intent fsync failure")
+
+    monkeypatch.setattr(artifacts_module, "_append_cleanup_entry", fail_intent)
+
+    with pytest.raises(ArtifactCleanupPartialFailure) as captured:
+        cleanup_artifacts(
+            completed_run,
+            ["checkpoint.pt"],
+            expected_manifest_hash=manifest_hash(completed_run),
+        )
+
+    assert captured.value.record.items == ()
+    assert payload.read_bytes() == b"keep"
+
+
+def test_cleanup_completion_failure_reports_the_deleted_item(
+    completed_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a post-unlink fsync failure hiding an actual deletion."""
+    payload = completed_run / "artifacts" / "checkpoint.pt"
+    payload.write_bytes(b"delete me")
+    real_append = artifacts_module._append_cleanup_entry
+
+    def fail_completion(stream: object, entry: object) -> None:
+        if getattr(entry, "phase", None) == "completed":
+            raise OSError("injected completion fsync failure")
+        real_append(stream, entry)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(artifacts_module, "_append_cleanup_entry", fail_completion)
+
+    with pytest.raises(ArtifactCleanupPartialFailure) as captured:
+        cleanup_artifacts(
+            completed_run,
+            ["checkpoint.pt"],
+            expected_manifest_hash=manifest_hash(completed_run),
+        )
+
+    assert not payload.exists()
+    assert [item.path for item in captured.value.record.items] == ["checkpoint.pt"]
+    entries = [
+        json.loads(line)
+        for line in (completed_run / "artifact-tombstones.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [entry["phase"] for entry in entries] == ["intent"]
+
+
+def test_cleanup_journals_each_item_before_and_after_unlink(
+    completed_run: Path,
+) -> None:
+    """Catches batch-only tombstones that cannot recover the unlink boundary."""
+    first = completed_run / "artifacts" / "first.pt"
+    second = completed_run / "artifacts" / "second.pt"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    cleanup_artifacts(
+        completed_run,
+        ["first.pt", "second.pt"],
+        expected_manifest_hash=manifest_hash(completed_run),
+    )
+
+    entries = [
+        json.loads(line)
+        for line in (completed_run / "artifact-tombstones.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [(entry["item"]["path"], entry["phase"]) for entry in entries] == [
+        ("first.pt", "intent"),
+        ("first.pt", "completed"),
+        ("second.pt", "intent"),
+        ("second.pt", "completed"),
+    ]

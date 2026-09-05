@@ -16,11 +16,13 @@ from .lifecycle import (
 from .repository import (
     InvalidRunTransition,
     RunManifestIntegrityError,
+    RunPersistenceError,
     RunRepository,
     RunStateConflict,
     load_run_manifest,
     manifest_hash,
     transition_run,
+    verify_run_integrity,
 )
 from .snapshots import SnapshotValidationError, hash_tree, prepare_run
 
@@ -34,6 +36,7 @@ __all__ = [
     "InvalidRunTransition",
     "RunEvent",
     "RunManifestIntegrityError",
+    "RunPersistenceError",
     "RunRepository",
     "RunStateConflict",
     "SnapshotValidationError",
@@ -44,4 +47,5 @@ __all__ = [
     "manifest_hash",
     "prepare_run",
     "transition_run",
+    "verify_run_integrity",
 ]

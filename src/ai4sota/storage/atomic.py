@@ -16,12 +16,13 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        _durable_replace(temporary, path)
+        durable_replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def _durable_replace(source: Path, destination: Path) -> None:
+def durable_replace(source: Path, destination: Path) -> None:
+    """Replace a file or publish a directory with durable parent metadata."""
     if os.name == "nt":
         _replace_windows_write_through(source, destination)
         return

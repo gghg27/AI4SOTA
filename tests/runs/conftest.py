@@ -200,7 +200,25 @@ def runnable_project(tmp_path: Path) -> tuple[ProjectLayout, ExperimentSpec, Pat
     (schemas / "prediction.json").write_text(
         '{"required": ["logits"]}\n', encoding="utf-8"
     )
-    (layout.root / "pipeline.py").write_text("RUNNER = 'v1'\n", encoding="utf-8")
+    pipeline = layout.root / "pipeline.py"
+    pipeline.write_text("RUNNER = 'v1'\n", encoding="utf-8")
+
+    input_files = [
+        layout.project_file,
+        layout.task_file,
+        *(path for kind in ModuleKind for path in layout.module_dir(kind).rglob("*")),
+        adapter,
+        configs / "train.yaml",
+        schemas / "prediction.json",
+        fingerprint_record,
+        layout.splits_dir / "approved.yaml",
+        pipeline,
+    ]
+    input_hashes = {
+        path.relative_to(layout.root).as_posix(): sha256_file(path)
+        for path in sorted(input_files)
+        if path.is_file()
+    }
 
     experiment = write_hashed_manifest(
         layout.root / "approved-experiment.yaml",
@@ -216,6 +234,7 @@ def runnable_project(tmp_path: Path) -> tuple[ProjectLayout, ExperimentSpec, Pat
             "data_fingerprint_hash": fingerprint_hash,
             "split_manifest_hash": split.content_hash,
             "seed": 17,
+            "input_hashes": input_hashes,
             "generated_adapter_hashes": [sha256_file(adapter)],
             "runtime_config": {"batch_size": 16},
             "environment": {"python": "3.11"},

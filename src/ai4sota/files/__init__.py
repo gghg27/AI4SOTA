@@ -9,6 +9,7 @@ from .patches import (
     PatchValidationError,
     apply_patch_set,
 )
+from .stable import StableFile, StableReadError, stable_read_file
 
 __all__ = [
     "AppliedPatch",
@@ -16,6 +17,9 @@ __all__ = [
     "PatchSet",
     "PatchTarget",
     "PatchValidationError",
+    "StableFile",
+    "StableReadError",
     "apply_patch_set",
     "sha256_file",
+    "stable_read_file",
 ]

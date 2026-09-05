@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import PurePosixPath
+
 from pydantic import Field, field_validator, model_validator
 
 from .common import (
@@ -47,10 +49,34 @@ class ExperimentSpec(SchemaHeader):
     data_fingerprint_hash: ContentHash
     split_manifest_hash: ContentHash
     seed: int
+    input_hashes: dict[NonEmptyStr, ContentHash]
     generated_adapter_hashes: tuple[ContentHash, ...] = ()
     runtime_config: dict[str, object] = Field(default_factory=dict)
     environment: dict[str, object] = Field(default_factory=dict)
     approval_id: NonEmptyStr | None = None
+
+    @field_validator("input_hashes", mode="before")
+    @classmethod
+    def input_paths_are_canonical_and_not_empty(cls, value: object) -> object:
+        if not isinstance(value, dict) or not value:
+            raise ValueError("input_hashes must contain at least one input")
+        for raw_path in value:
+            if not isinstance(raw_path, str):
+                raise TypeError("input_hashes keys must be paths")
+            path = PurePosixPath(raw_path)
+            if (
+                not path.parts
+                or raw_path != raw_path.strip()
+                or "\\" in raw_path
+                or path.is_absolute()
+                or path.as_posix() != raw_path
+                or ".." in path.parts
+                or (path.parts and ":" in path.parts[0])
+            ):
+                raise ValueError(
+                    "input_hashes keys must be canonical project-relative POSIX paths"
+                )
+        return value
 
 
 class RunManifest(SchemaHeader):
