@@ -1,0 +1,10 @@
+api_version: ai4sota/v1
+id: task/unconfigured
+version: 1.0.0
+content_hash: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+prediction_unit: sample
+target_type: unconfigured
+classes:
+  unconfigured: 0
+required_metadata:
+  - sample_id

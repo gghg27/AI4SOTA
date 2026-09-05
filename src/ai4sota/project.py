@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 
 from .io_utils import file_fingerprint, read_yaml, utc_now, write_json, write_yaml
+from .storage import atomic_write_bytes
 
 REQUIRED_PROJECT_FILES = (
     "project.yaml",
@@ -115,7 +116,7 @@ def _copy_template_tree(source, target: Path) -> None:
         if item.is_dir():
             _copy_template_tree(item, destination)
         else:
-            destination.write_bytes(item.read_bytes())
+            atomic_write_bytes(destination, item.read_bytes())
 
 
 def _create_demo_dataset(path: Path) -> None:
