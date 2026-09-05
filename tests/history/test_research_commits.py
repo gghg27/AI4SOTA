@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import yaml  # type: ignore[import-untyped]
 
 from ai4sota.domain import ModuleKind, ResearchCommitManifest, RunManifest
 from ai4sota.files import stable_read_file
@@ -198,6 +200,17 @@ def transaction_dir(project: ProjectLayout) -> Path:
         )
     )
     return value if value.is_absolute() else project.root / value
+
+
+def make_directory_junction(link: Path, target: Path) -> None:
+    linked = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if linked.returncode != 0:
+        pytest.skip("directory junction creation is unavailable")
 
 
 def test_commit_persists_authoritative_manifest_ref_and_exact_snapshot_tree(
@@ -456,6 +469,23 @@ def test_commit_includes_ignored_snapshot_files_with_exact_bytes(
         capture_output=True,
     ).stdout
     assert blob == expected
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX executable mode semantics")
+def test_commit_preserves_snapshot_executable_mode(
+    git_project: ProjectLayout,
+) -> None:
+    run = completed_run(git_project)
+    executable = git_project.runs_dir / run.id / "snapshot" / "run.sh"
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    run = rehash_run(git_project, run)
+
+    result = create_research_commit(git_project, DRAFT, [run.id])
+
+    entry = git(git_project.root, "ls-tree", result.git_sha, "run.sh")
+    assert entry.startswith("100755 blob ")
+    assert temporary_worktrees(git_project) == ()
 
 
 def test_snapshot_mutation_during_materialization_is_rejected(
@@ -874,8 +904,10 @@ def test_retry_recovers_crash_between_manifest_and_ref_publication(
     run = completed_run(git_project)
     original_write = research_commits._write_research_manifest
 
-    def write_then_crash(path: Path, value: ResearchCommitManifest) -> None:
-        original_write(path, value)
+    def write_then_crash(  # type: ignore[no-untyped-def]
+        path: Path, value: ResearchCommitManifest, **kwargs
+    ) -> None:
+        original_write(path, value, **kwargs)
         raise SystemExit("simulated process termination")
 
     monkeypatch.setattr(research_commits, "_write_research_manifest", write_then_crash)
@@ -912,6 +944,229 @@ def test_retry_recovers_crash_between_manifest_and_ref_publication(
     assert tuple(
         transaction_dir(git_project).glob("*.yaml")
     ) == ()
+    assert temporary_worktrees(git_project) == ()
+
+
+def test_retry_recovers_crash_during_pending_write(
+    git_project: ProjectLayout,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = completed_run(git_project)
+    original_pending = research_commits._write_pending
+    original_fdopen = os.fdopen
+    writing_pending = False
+
+    class PartialWriter:
+        def __init__(self, stream):  # type: ignore[no-untyped-def]
+            self.stream = stream
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return self.stream.__exit__(*args)
+
+        def write(self, data: bytes) -> int:
+            self.stream.write(data[: max(1, len(data) // 2)])
+            self.stream.flush()
+            raise SystemExit("simulated crash during pending write")
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            return getattr(self.stream, name)
+
+    def partial_fdopen(*args, **kwargs):  # type: ignore[no-untyped-def]
+        stream = original_fdopen(*args, **kwargs)
+        return PartialWriter(stream) if writing_pending else stream
+
+    def crash_inside_pending_write(  # type: ignore[no-untyped-def]
+        path, transaction_id, manifest
+    ):
+        nonlocal writing_pending
+        writing_pending = True
+        try:
+            return original_pending(path, transaction_id, manifest)
+        finally:
+            writing_pending = False
+
+    monkeypatch.setattr(research_commits.os, "fdopen", partial_fdopen)
+    monkeypatch.setattr(
+        research_commits,
+        "_write_pending",
+        crash_inside_pending_write,
+    )
+    with pytest.raises(SystemExit, match="during pending write"):
+        create_research_commit(git_project, DRAFT, [run.id])
+
+    assert tuple(transaction_dir(git_project).glob("*.pending.yaml")) == ()
+
+    monkeypatch.setattr(research_commits.os, "fdopen", original_fdopen)
+    monkeypatch.setattr(research_commits, "_write_pending", original_pending)
+    recovered = create_research_commit(git_project, DRAFT, [run.id])
+
+    assert git(
+        git_project.root,
+        "rev-parse",
+        "refs/ai4sota/research/research-commit-001",
+    ) == recovered.git_sha
+    assert temporary_worktrees(git_project) == ()
+
+
+def test_retry_recovers_crash_during_manifest_write(
+    git_project: ProjectLayout,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = completed_run(git_project)
+    original_manifest = research_commits._write_research_manifest
+    original_fdopen = os.fdopen
+    writing_manifest = False
+
+    class PartialWriter:
+        def __init__(self, stream):  # type: ignore[no-untyped-def]
+            self.stream = stream
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return self.stream.__exit__(*args)
+
+        def write(self, data: bytes) -> int:
+            self.stream.write(data[: max(1, len(data) // 2)])
+            self.stream.flush()
+            raise SystemExit("simulated crash during manifest write")
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            return getattr(self.stream, name)
+
+    def partial_fdopen(*args, **kwargs):  # type: ignore[no-untyped-def]
+        stream = original_fdopen(*args, **kwargs)
+        return PartialWriter(stream) if writing_manifest else stream
+
+    def crash_inside_manifest_write(  # type: ignore[no-untyped-def]
+        path, manifest, **kwargs
+    ):
+        nonlocal writing_manifest
+        writing_manifest = True
+        try:
+            return original_manifest(path, manifest, **kwargs)
+        finally:
+            writing_manifest = False
+
+    monkeypatch.setattr(research_commits.os, "fdopen", partial_fdopen)
+    monkeypatch.setattr(
+        research_commits,
+        "_write_research_manifest",
+        crash_inside_manifest_write,
+    )
+    with pytest.raises(SystemExit, match="during manifest write"):
+        create_research_commit(git_project, DRAFT, [run.id])
+
+    manifest_path = git_project.research_commits_dir / DRAFT["id"] / "manifest.yaml"
+    assert not manifest_path.exists()
+    assert len(tuple(transaction_dir(git_project).glob("*.pending.yaml"))) == 1
+
+    monkeypatch.setattr(research_commits.os, "fdopen", original_fdopen)
+    monkeypatch.setattr(
+        research_commits,
+        "_write_research_manifest",
+        original_manifest,
+    )
+    recovered = create_research_commit(git_project, DRAFT, [run.id])
+
+    assert ManifestStore().read(manifest_path, ResearchCommitManifest) == recovered
+    assert git(
+        git_project.root,
+        "rev-parse",
+        "refs/ai4sota/research/research-commit-001",
+    ) == recovered.git_sha
+    assert temporary_worktrees(git_project) == ()
+
+
+def test_retry_recovers_crash_during_owner_write(
+    git_project: ProjectLayout,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = completed_run(git_project)
+    original_write = research_commits._write_exclusive_bytes
+    original_fdopen = os.fdopen
+    writing_owner = False
+
+    class PartialWriter:
+        def __init__(self, stream):  # type: ignore[no-untyped-def]
+            self.stream = stream
+
+        def __enter__(self):  # type: ignore[no-untyped-def]
+            self.stream.__enter__()
+            return self
+
+        def __exit__(self, *args):  # type: ignore[no-untyped-def]
+            return self.stream.__exit__(*args)
+
+        def write(self, data: bytes) -> int:
+            self.stream.write(data[: max(1, len(data) // 2)])
+            self.stream.flush()
+            raise SystemExit("simulated crash during owner write")
+
+        def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+            return getattr(self.stream, name)
+
+    def partial_fdopen(*args, **kwargs):  # type: ignore[no-untyped-def]
+        stream = original_fdopen(*args, **kwargs)
+        return PartialWriter(stream) if writing_owner else stream
+
+    def crash_inside_owner_write(  # type: ignore[no-untyped-def]
+        path: Path, data: bytes, **kwargs
+    ) -> None:
+        nonlocal writing_owner
+        if path.name != ".publication-owner":
+            original_write(path, data, **kwargs)
+            return
+        writing_owner = True
+        try:
+            original_write(path, data, **kwargs)
+        finally:
+            writing_owner = False
+
+    monkeypatch.setattr(research_commits.os, "fdopen", partial_fdopen)
+    monkeypatch.setattr(
+        research_commits,
+        "_write_exclusive_bytes",
+        crash_inside_owner_write,
+    )
+    with pytest.raises(SystemExit, match="during owner write"):
+        create_research_commit(git_project, DRAFT, [run.id])
+
+    manifest_dir = git_project.research_commits_dir / DRAFT["id"]
+    assert not (manifest_dir / ".publication-owner").exists()
+    pending = tuple(transaction_dir(git_project).glob("*.pending.yaml"))
+    assert len(pending) == 1
+    transaction_id = yaml.safe_load(pending[0].read_text(encoding="utf-8"))[
+        "transaction_id"
+    ]
+    owner_temps = tuple(
+        manifest_dir.glob(f".publication-owner.{transaction_id}.*.tmp")
+    )
+    assert len(owner_temps) == 1
+
+    monkeypatch.setattr(research_commits.os, "fdopen", original_fdopen)
+    monkeypatch.setattr(
+        research_commits,
+        "_write_exclusive_bytes",
+        original_write,
+    )
+    recovered = create_research_commit(git_project, DRAFT, [run.id])
+
+    assert ManifestStore().read(
+        manifest_dir / "manifest.yaml", ResearchCommitManifest
+    ) == recovered
+    assert git(
+        git_project.root,
+        "rev-parse",
+        "refs/ai4sota/research/research-commit-001",
+    ) == recovered.git_sha
+    assert not owner_temps[0].exists()
     assert temporary_worktrees(git_project) == ()
 
 
@@ -1019,21 +1274,18 @@ def test_rollback_does_not_follow_commit_directory_reparse_race(
     sentinel = outside / "keep.txt"
     sentinel.write_text("keep", encoding="utf-8")
     original_run = GitAdapter.run
+    displaced = git_project.research_commits_dir / "research-commit-001-original"
 
     def replace_directory_before_ref(self, cwd, *args):  # type: ignore[no-untyped-def]
         if args and args[0] == "update-ref" and "research-commit-001" in args[1]:
             directory = git_project.research_commits_dir / "research-commit-001"
-            for child in directory.iterdir():
-                child.unlink()
-            directory.rmdir()
-            linked = subprocess.run(
-                ["cmd", "/c", "mklink", "/J", str(directory), str(outside)],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if linked.returncode != 0:
-                pytest.skip("directory junction creation is unavailable")
+            try:
+                directory.rename(displaced)
+            except OSError:
+                raise PublicationFailure(
+                    "ref publication failed after path replacement"
+                ) from None
+            make_directory_junction(directory, outside)
             raise PublicationFailure("ref publication failed after path replacement")
         return original_run(self, cwd, *args)
 
@@ -1057,3 +1309,117 @@ def test_rollback_does_not_follow_commit_directory_reparse_race(
         check=False,
     ).returncode != 0
     assert temporary_worktrees(git_project) == ()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory-handle semantics")
+def test_owner_creation_does_not_follow_parent_swap_after_validation(
+    git_project: ProjectLayout,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = completed_run(git_project)
+    outside = git_project.root.parent / "outside-owner-create"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    outside_commit = outside / DRAFT["id"]
+    outside_commit.mkdir()
+    root = git_project.research_commits_dir
+    displaced = root.with_name("research-commits-original")
+    original_write = research_commits._write_exclusive_bytes
+    attempted = False
+    swapped = False
+
+    def swap_before_owner_create(  # type: ignore[no-untyped-def]
+        path: Path, data: bytes, **kwargs
+    ) -> None:
+        nonlocal attempted, swapped
+        if path.name == ".publication-owner" and not attempted:
+            attempted = True
+            try:
+                root.rename(displaced)
+            except OSError:
+                pass
+            else:
+                make_directory_junction(root, outside)
+                swapped = True
+        original_write(path, data, **kwargs)
+
+    monkeypatch.setattr(
+        research_commits,
+        "_write_exclusive_bytes",
+        swap_before_owner_create,
+    )
+    try:
+        try:
+            create_research_commit(git_project, DRAFT, [run.id])
+        except ResearchCommitError:
+            pass
+        assert attempted
+        assert not (outside_commit / ".publication-owner").exists()
+        assert not (outside_commit / "manifest.yaml").exists()
+        assert sentinel.read_text(encoding="utf-8") == "keep"
+    finally:
+        if swapped and root.exists():
+            root.rmdir()
+        if displaced.exists():
+            displaced.rename(root)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory-handle semantics")
+def test_rollback_does_not_delete_after_owned_directory_swap(
+    git_project: ProjectLayout,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class PublicationFailure(RuntimeError):
+        pass
+
+    run = completed_run(git_project)
+    outside = git_project.root.parent / "outside-owned-rollback"
+    outside.mkdir()
+    sentinel = outside / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    directory = git_project.research_commits_dir / DRAFT["id"]
+    displaced = directory.with_name(f"{directory.name}-original")
+    manifest_path = directory / "manifest.yaml"
+    original_unlink = Path.unlink
+    original_run = GitAdapter.run
+    attempted = False
+    swapped = False
+
+    def fail_ref(self, cwd, *args):  # type: ignore[no-untyped-def]
+        if args and args[0] == "update-ref" and "research-commit-001" in args[1]:
+            raise PublicationFailure("ref publication failed")
+        return original_run(self, cwd, *args)
+
+    def swap_before_manifest_unlink(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal attempted, swapped
+        if self == manifest_path and not attempted:
+            attempted = True
+            (outside / "manifest.yaml").write_bytes(manifest_path.read_bytes())
+            (outside / ".publication-owner").write_bytes(
+                (directory / ".publication-owner").read_bytes()
+            )
+            try:
+                directory.rename(displaced)
+            except OSError:
+                (outside / "manifest.yaml").unlink()
+                (outside / ".publication-owner").unlink()
+            else:
+                make_directory_junction(directory, outside)
+                swapped = True
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(GitAdapter, "run", fail_ref)
+    monkeypatch.setattr(Path, "unlink", swap_before_manifest_unlink)
+    try:
+        with pytest.raises(PublicationFailure, match="ref publication failed"):
+            create_research_commit(git_project, DRAFT, [run.id])
+
+        assert attempted
+        assert tuple(outside.iterdir()) == (sentinel,)
+    finally:
+        monkeypatch.setattr(Path, "unlink", original_unlink)
+        if swapped and directory.exists():
+            directory.rmdir()
+        if displaced.exists():
+            displaced.rename(directory)

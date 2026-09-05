@@ -9,7 +9,8 @@ import stat
 import subprocess
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any
@@ -48,6 +49,13 @@ ZERO_HASH = "sha256:" + "0" * 64
 
 class ResearchCommitError(ValueError):
     """Raised when Runs cannot be promoted into one research commit."""
+
+
+@dataclass(frozen=True)
+class _BoundDirectory:
+    path: Path
+    descriptor: int | None = None
+    windows_handle: int | None = None
 
 
 def create_research_commit(
@@ -330,37 +338,43 @@ def _publication_lock(
     pending_path = transaction_root / f"{key}.pending.yaml"
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = -1
-    try:
-        descriptor = os.open(lock_path, flags, 0o600)
-        opened = os.fstat(descriptor)
-        current = lock_path.lstat()
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or _is_link_or_reparse(lock_path)
-            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
-        ):
-            raise ResearchCommitError("research publication lock is not a stable file")
-    except ResearchCommitError:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise
-    except OSError as error:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise ResearchCommitError("cannot open research publication lock") from error
-    with os.fdopen(descriptor, "r+b") as stream:
-        if lock_path.stat().st_size == 0:
-            stream.write(b"\0")
-            stream.flush()
-            os.fsync(stream.fileno())
-        stream.seek(0)
-        _lock_file(stream.fileno())
+    with _bound_directory(transaction_root) as directory:
+        descriptor = -1
         try:
-            yield pending_path
-        finally:
+            if directory.descriptor is not None:
+                descriptor = os.open(
+                    lock_path.name,
+                    flags,
+                    0o600,
+                    dir_fd=directory.descriptor,
+                )
+            else:
+                descriptor = os.open(lock_path, flags, 0o600)
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ResearchCommitError(
+                    "research publication lock is not a stable file"
+                )
+        except ResearchCommitError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        except OSError as error:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise ResearchCommitError("cannot open research publication lock") from error
+        with os.fdopen(descriptor, "r+b") as stream:
+            if opened.st_size == 0:
+                stream.write(b"\0")
+                stream.flush()
+                os.fsync(stream.fileno())
             stream.seek(0)
-            _unlock_file(stream.fileno())
+            _lock_file(stream.fileno())
+            try:
+                yield pending_path
+            finally:
+                stream.seek(0)
+                _unlock_file(stream.fileno())
 
 
 def _transaction_root(project: ProjectLayout, git: GitAdapter) -> Path:
@@ -391,7 +405,7 @@ def _write_pending(
         "manifest": manifest.model_dump(mode="json"),
     }
     data = yaml.safe_dump(document, allow_unicode=True, sort_keys=False).encode("utf-8")
-    _write_exclusive_bytes(path, data)
+    _write_exclusive_bytes(path, data, owner_token=transaction_id)
 
 
 def _recover_pending(
@@ -400,10 +414,12 @@ def _recover_pending(
     pending_path: Path,
     commit_id: str,
 ) -> ResearchCommitManifest | None:
-    if not pending_path.exists() and not _is_link_or_reparse(pending_path):
-        return None
     try:
-        document = yaml.safe_load(stable_read_file(pending_path).data.decode("utf-8"))
+        with _bound_directory(pending_path.parent) as directory:
+            if not _entry_exists(directory, pending_path.name):
+                return None
+            data = _read_bound_file(directory, pending_path.name).data
+        document = yaml.safe_load(data.decode("utf-8"))
         if not isinstance(document, Mapping):
             raise TypeError("pending transaction must be a mapping")
         transaction_id = document["transaction_id"]
@@ -451,22 +467,43 @@ def _publish_transaction(
     zero_oid: str,
 ) -> None:
     manifest_path = _manifest_path(project, manifest.id)
-    owner_path = _reserve_manifest_directory(manifest_path, transaction_id, manifest)
-    if manifest_path.exists():
-        if _load_research_manifest(manifest_path, "research commit") != manifest:
-            raise ResearchCommitError("research commit manifest publication conflict")
-    else:
-        _write_research_manifest(manifest_path, manifest)
+    _reserve_manifest_directory(project, manifest_path, transaction_id, manifest)
+    with _bound_manifest_directory(project, manifest.id) as (
+        directory,
+        _,
+        _,
+    ):
+        _remove_owned_temporaries(directory, manifest_path.name, transaction_id)
+        if _entry_exists(directory, manifest_path.name):
+            if (
+                _load_research_manifest_bound(directory, "research commit")
+                != manifest
+            ):
+                raise ResearchCommitError(
+                    "research commit manifest publication conflict"
+                )
+        else:
+            _write_research_manifest(
+                manifest_path,
+                manifest,
+                directory=directory,
+                transaction_id=transaction_id,
+            )
 
-    ref_name = f"refs/ai4sota/research/{manifest.id}"
-    ref_sha = _read_ref(git, project.root, ref_name)
-    if ref_sha is None:
-        git.run(project.root, "update-ref", ref_name, manifest.git_sha, zero_oid)
-    elif ref_sha != manifest.git_sha:
-        raise ResearchCommitError("research commit ref publication conflict")
+        ref_name = f"refs/ai4sota/research/{manifest.id}"
+        ref_sha = _read_ref(git, project.root, ref_name)
+        if ref_sha is None:
+            git.run(project.root, "update-ref", ref_name, manifest.git_sha, zero_oid)
+        elif ref_sha != manifest.git_sha:
+            raise ResearchCommitError("research commit ref publication conflict")
 
-    if owner_path.exists():
-        _remove_owned_file(owner_path, transaction_id.encode("ascii"))
+        owner_path = manifest_path.parent / ".publication-owner"
+        if _entry_exists(directory, owner_path.name):
+            _remove_owned_file(
+                owner_path,
+                transaction_id.encode("ascii"),
+                directory=directory,
+            )
     _remove_owned_pending(pending_path, transaction_id)
 
 
@@ -476,9 +513,12 @@ def _publication_is_complete(
     manifest: ResearchCommitManifest,
 ) -> bool:
     try:
-        persisted = _load_research_manifest(
-            _manifest_path(project, manifest.id), "research commit"
-        )
+        with _bound_manifest_directory(project, manifest.id) as (
+            directory,
+            _,
+            _,
+        ):
+            persisted = _load_research_manifest_bound(directory, "research commit")
         ref_sha = _read_ref(
             git,
             project.root,
@@ -489,34 +529,131 @@ def _publication_is_complete(
     return persisted == manifest and ref_sha == manifest.git_sha
 
 
+@contextmanager
+def _bound_manifest_directory(
+    project: ProjectLayout,
+    commit_id: str,
+    *,
+    create: bool = False,
+) -> Iterator[tuple[_BoundDirectory, _BoundDirectory, bool]]:
+    parts = PurePosixPath(commit_id).parts
+    with ExitStack() as stack:
+        current = stack.enter_context(_bound_directory(project.research_commits_dir))
+        parent = current
+        created_final = False
+        for index, part in enumerate(parts):
+            is_final = index == len(parts) - 1
+            if not _entry_exists(current, part):
+                if not create:
+                    raise FileNotFoundError(current.path / part)
+                _mkdir_bound(current, part)
+                if is_final:
+                    created_final = True
+            parent = current
+            current = stack.enter_context(
+                _bound_child_directory(parent, part, delete_access=is_final)
+            )
+        yield current, parent, created_final
+
+
+def _mkdir_bound(directory: _BoundDirectory, name: str) -> None:
+    if directory.descriptor is not None:
+        os.mkdir(name, mode=0o700, dir_fd=directory.descriptor)
+        os.fsync(directory.descriptor)
+        return
+    (directory.path / name).mkdir(mode=0o700)
+
+
+def _delete_bound_directory(
+    directory: _BoundDirectory,
+    parent: _BoundDirectory,
+    name: str,
+) -> None:
+    if directory.windows_handle is not None:
+        _mark_windows_handle_for_deletion(directory.windows_handle)
+        return
+    if parent.descriptor is None:
+        raise ResearchCommitError("bound directory parent has no usable handle")
+    os.rmdir(name, dir_fd=parent.descriptor)
+    os.fsync(parent.descriptor)
+
+
+def _mark_windows_handle_for_deletion(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileDispositionInformation(ctypes.Structure):
+        _fields_ = [("delete_file", wintypes.BOOL)]
+
+    set_information = ctypes.WinDLL(
+        "kernel32", use_last_error=True
+    ).SetFileInformationByHandle
+    set_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    set_information.restype = wintypes.BOOL
+    information = FileDispositionInformation(True)
+    file_disposition_info = 4
+    if not set_information(
+        handle,
+        file_disposition_info,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 def _reserve_manifest_directory(
+    project: ProjectLayout,
     manifest_path: Path,
     transaction_id: str,
     manifest: ResearchCommitManifest,
 ) -> Path:
-    directory = manifest_path.parent
-    owner_path = directory / ".publication-owner"
-    if not directory.exists():
-        durable_make_directory(directory.parent)
-        _reject_link_components(directory.parent)
-        try:
-            directory.mkdir()
-        except FileExistsError:
-            pass
-        else:
-            _write_exclusive_bytes(owner_path, transaction_id.encode("ascii"))
+    owner_path = manifest_path.parent / ".publication-owner"
+    with _bound_manifest_directory(project, manifest.id, create=True) as (
+        directory,
+        _,
+        created,
+    ):
+        if created:
+            _write_exclusive_bytes(
+                owner_path,
+                transaction_id.encode("ascii"),
+                directory=directory,
+                owner_token=transaction_id,
+            )
             return owner_path
-    if _is_link_or_reparse(directory) or not directory.is_dir():
-        raise ResearchCommitError("research commit directory cannot contain links")
-    if owner_path.exists():
-        if stable_read_file(owner_path).data != transaction_id.encode("ascii"):
-            raise ResearchCommitError("research commit directory has another owner")
-        return owner_path
-    if manifest_path.exists() and _load_research_manifest(
-        manifest_path, "research commit"
-    ) == manifest:
-        return owner_path
-    raise ResearchCommitError("research commit directory is not transaction-owned")
+        if _entry_exists(directory, owner_path.name):
+            if (
+                _read_bound_file(directory, owner_path.name).data
+                != transaction_id.encode("ascii")
+            ):
+                raise ResearchCommitError("research commit directory has another owner")
+            _remove_owned_temporaries(directory, owner_path.name, transaction_id)
+            return owner_path
+        if _entry_exists(
+            directory, manifest_path.name
+        ) and _load_research_manifest_bound(directory, "research commit") == manifest:
+            return owner_path
+        owner_temporaries = _owned_temporary_names(
+            directory, owner_path.name, transaction_id
+        )
+        if owner_temporaries:
+            for temporary_name in owner_temporaries:
+                _unlink_bound(directory, temporary_name)
+            _write_exclusive_bytes(
+                owner_path,
+                transaction_id.encode("ascii"),
+                directory=directory,
+                owner_token=transaction_id,
+            )
+            return owner_path
+        raise ResearchCommitError(
+            "research commit directory is not transaction-owned"
+        )
 
 
 def _rollback_transaction(
@@ -534,23 +671,36 @@ def _rollback_transaction(
         pass
     try:
         manifest_path = _manifest_path(project, manifest.id)
-        owner_path = manifest_path.parent / ".publication-owner"
         try:
-            owned = (
-                owner_path.exists()
-                and stable_read_file(owner_path).data
-                == transaction_id.encode("ascii")
-            )
-            if (
-                owned
-                and manifest_path.exists()
-                and _load_research_manifest(manifest_path, "research commit")
-                == manifest
+            with _bound_manifest_directory(project, manifest.id) as (
+                directory,
+                parent,
+                _,
             ):
-                manifest_path.unlink()
-            if owned:
-                _remove_owned_file(owner_path, transaction_id.encode("ascii"))
-                manifest_path.parent.rmdir()
+                owner_path = manifest_path.parent / ".publication-owner"
+                owned = _entry_exists(
+                    directory, owner_path.name
+                ) and _read_bound_file(directory, owner_path.name).data == (
+                    transaction_id.encode("ascii")
+                )
+                if (
+                    owned
+                    and _entry_exists(directory, manifest_path.name)
+                    and _load_research_manifest_bound(directory, "research commit")
+                    == manifest
+                ):
+                    _unlink_bound(directory, manifest_path.name)
+                if owned:
+                    _remove_owned_file(
+                        owner_path,
+                        transaction_id.encode("ascii"),
+                        directory=directory,
+                    )
+                    _delete_bound_directory(
+                        directory,
+                        parent,
+                        PurePosixPath(manifest.id).parts[-1],
+                    )
         except (OSError, StableReadError, ResearchCommitError):
             pass
     finally:
@@ -592,15 +742,31 @@ def _manifest_matches_request(
 
 def _load_research_manifest(path: Path, label: str) -> ResearchCommitManifest:
     try:
-        document = yaml.safe_load(stable_read_file(path).data.decode("utf-8"))
-        manifest = ResearchCommitManifest.model_validate(document)
+        data = stable_read_file(path).data
     except (
         OSError,
         StableReadError,
-        UnicodeError,
-        yaml.YAMLError,
-        ValidationError,
     ) as error:
+        raise ResearchCommitError(f"{label} manifest cannot be verified") from error
+    return _parse_research_manifest(data, label)
+
+
+def _load_research_manifest_bound(
+    directory: _BoundDirectory,
+    label: str,
+) -> ResearchCommitManifest:
+    try:
+        data = _read_bound_file(directory, "manifest.yaml").data
+    except (OSError, StableReadError) as error:
+        raise ResearchCommitError(f"{label} manifest cannot be verified") from error
+    return _parse_research_manifest(data, label)
+
+
+def _parse_research_manifest(data: bytes, label: str) -> ResearchCommitManifest:
+    try:
+        document = yaml.safe_load(data.decode("utf-8"))
+        manifest = ResearchCommitManifest.model_validate(document)
+    except (UnicodeError, yaml.YAMLError, ValidationError) as error:
         raise ResearchCommitError(f"{label} manifest cannot be verified") from error
     if manifest.content_hash != canonical_manifest_hash(manifest):
         raise ResearchCommitError(f"{label} manifest hash mismatch")
@@ -627,46 +793,415 @@ def _load_project_manifest(path: Path) -> ProjectSpec:
 def _write_research_manifest(
     path: Path,
     manifest: ResearchCommitManifest,
+    *,
+    directory: _BoundDirectory | None = None,
+    transaction_id: str,
 ) -> None:
     data = yaml.safe_dump(
         manifest.model_dump(mode="json"),
         allow_unicode=True,
         sort_keys=False,
     ).encode("utf-8")
-    _reject_link_components(path.parent)
-    _write_exclusive_bytes(path, data)
+    _write_exclusive_bytes(
+        path,
+        data,
+        directory=directory,
+        owner_token=transaction_id,
+    )
 
 
-def _write_exclusive_bytes(path: Path, data: bytes) -> None:
+def _write_exclusive_bytes(
+    path: Path,
+    data: bytes,
+    *,
+    directory: _BoundDirectory | None = None,
+    owner_token: str,
+) -> None:
+    if directory is None:
+        with _bound_directory(path.parent) as opened:
+            _atomic_create_bound(opened, path.name, data, owner_token)
+        return
+    if Path(os.path.abspath(path.parent)) != directory.path:
+        raise ResearchCommitError("exclusive file parent does not match bound directory")
+    _atomic_create_bound(directory, path.name, data, owner_token)
+
+
+def _atomic_create_bound(
+    directory: _BoundDirectory,
+    name: str,
+    data: bytes,
+    owner_token: str,
+) -> None:
+    temporary_stem = name if name.startswith(".") else f".{name}"
+    temporary_name = f"{temporary_stem}.{owner_token}.{uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags, 0o600)
-    opened = os.fstat(descriptor)
-    current = path.lstat()
-    if (
-        not stat.S_ISREG(opened.st_mode)
-        or _is_link_or_reparse(path)
-        or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
-    ):
-        os.close(descriptor)
-        raise ResearchCommitError("exclusive transaction file is not stable")
-    with os.fdopen(descriptor, "wb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
+    descriptor = -1
+    try:
+        if directory.descriptor is not None:
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=directory.descriptor,
+            )
+        else:
+            descriptor = os.open(directory.path / temporary_name, flags, 0o600)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ResearchCommitError("exclusive transaction file is not regular")
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = -1
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _publish_temporary_file(directory, temporary_name, name)
+    except BaseException as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if isinstance(error, Exception):
+            _unlink_bound(directory, temporary_name, missing_ok=True)
+        raise
+    else:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if _entry_exists(directory, temporary_name):
+            _unlink_bound(directory, temporary_name)
 
 
-def _remove_owned_file(path: Path, expected: bytes) -> None:
-    if not path.exists() or stable_read_file(path).data != expected:
+def _owned_temporary_names(
+    directory: _BoundDirectory,
+    name: str,
+    owner_token: str,
+) -> tuple[str, ...]:
+    temporary_stem = name if name.startswith(".") else f".{name}"
+    prefix = f"{temporary_stem}.{owner_token}."
+    suffix = ".tmp"
+    matches: list[str] = []
+    for candidate in _list_bound_entries(directory):
+        if not candidate.startswith(prefix) or not candidate.endswith(suffix):
+            continue
+        nonce = candidate[len(prefix) : -len(suffix)]
+        if len(nonce) == 32 and all(
+            character in "0123456789abcdef" for character in nonce
+        ):
+            matches.append(candidate)
+    return tuple(matches)
+
+
+def _remove_owned_temporaries(
+    directory: _BoundDirectory,
+    name: str,
+    owner_token: str,
+) -> None:
+    for temporary_name in _owned_temporary_names(directory, name, owner_token):
+        _unlink_bound(directory, temporary_name)
+
+
+def _publish_temporary_file(
+    directory: _BoundDirectory,
+    temporary_name: str,
+    name: str,
+) -> None:
+    if directory.descriptor is not None:
+        os.link(
+            temporary_name,
+            name,
+            src_dir_fd=directory.descriptor,
+            dst_dir_fd=directory.descriptor,
+            follow_symlinks=False,
+        )
+        os.fsync(directory.descriptor)
+        _unlink_bound(directory, temporary_name)
+        os.fsync(directory.descriptor)
+        return
+    _move_windows_file_exclusive(
+        directory.path / temporary_name,
+        directory.path / name,
+    )
+
+
+def _move_windows_file_exclusive(source: Path, destination: Path) -> None:
+    import ctypes
+
+    move_file_ex = ctypes.WinDLL("kernel32", use_last_error=True).MoveFileExW
+    move_file_ex.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    move_file_ex.restype = ctypes.c_int
+    write_through = 0x8
+    if move_file_ex(str(source), str(destination), write_through):
+        return
+    error_code = ctypes.get_last_error()
+    if error_code in {80, 183}:
+        raise FileExistsError(error_code, "destination already exists", destination)
+    raise ctypes.WinError(error_code)
+
+
+def _remove_owned_file(
+    path: Path,
+    expected: bytes,
+    *,
+    directory: _BoundDirectory | None = None,
+) -> None:
+    if directory is None:
+        with _bound_directory(path.parent) as opened:
+            _remove_owned_file(path, expected, directory=opened)
+        return
+    if _read_bound_file(directory, path.name).data != expected:
         raise ResearchCommitError("refusing to remove a file not owned by transaction")
-    path.unlink()
+    _unlink_bound(directory, path.name)
 
 
 def _remove_owned_pending(path: Path, transaction_id: str) -> None:
-    document = yaml.safe_load(stable_read_file(path).data.decode("utf-8"))
-    if not isinstance(document, Mapping) or document.get("transaction_id") != transaction_id:
-        raise ResearchCommitError("pending transaction ownership changed")
-    path.unlink()
+    with _bound_directory(path.parent) as directory:
+        document = yaml.safe_load(
+            _read_bound_file(directory, path.name).data.decode("utf-8")
+        )
+        if (
+            not isinstance(document, Mapping)
+            or document.get("transaction_id") != transaction_id
+        ):
+            raise ResearchCommitError("pending transaction ownership changed")
+        _unlink_bound(directory, path.name)
+
+
+@contextmanager
+def _bound_directory(
+    path: Path,
+    *,
+    delete_access: bool = False,
+) -> Iterator[_BoundDirectory]:
+    absolute = Path(os.path.abspath(path))
+    _reject_link_components(absolute)
+    if os.name == "nt":
+        before = absolute.lstat()
+        handle, file_index = _open_windows_directory(
+            absolute, delete_access=delete_access
+        )
+        try:
+            _reject_link_components(absolute)
+            after = absolute.lstat()
+            if (
+                (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or (after.st_ino != 0 and after.st_ino != file_index)
+            ):
+                raise ResearchCommitError("trusted directory identity changed")
+            yield _BoundDirectory(path=absolute, windows_handle=handle)
+        finally:
+            _close_windows_handle(handle)
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(absolute, flags)
+    try:
+        opened = os.fstat(descriptor)
+        current = absolute.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(current.st_mode)
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ResearchCommitError("trusted directory identity changed")
+        _reject_link_components(absolute)
+        yield _BoundDirectory(path=absolute, descriptor=descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _bound_child_directory(
+    parent: _BoundDirectory,
+    name: str,
+    *,
+    delete_access: bool = False,
+) -> Iterator[_BoundDirectory]:
+    path = parent.path / name
+    if parent.descriptor is None:
+        with _bound_directory(path, delete_access=delete_access) as opened:
+            yield opened
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=parent.descriptor)
+    try:
+        opened_metadata = os.fstat(descriptor)
+        current_metadata = os.stat(
+            name, dir_fd=parent.descriptor, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISDIR(opened_metadata.st_mode)
+            or stat.S_ISLNK(current_metadata.st_mode)
+            or (opened_metadata.st_dev, opened_metadata.st_ino)
+            != (current_metadata.st_dev, current_metadata.st_ino)
+        ):
+            raise ResearchCommitError("trusted child directory identity changed")
+        yield _BoundDirectory(path=path, descriptor=descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _open_windows_directory(path: Path, *, delete_access: bool) -> tuple[int, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileTime(ctypes.Structure):
+        _fields_ = [("low", wintypes.DWORD), ("high", wintypes.DWORD)]
+
+    class FileInformation(ctypes.Structure):
+        _fields_ = [
+            ("attributes", wintypes.DWORD),
+            ("creation_time", FileTime),
+            ("last_access_time", FileTime),
+            ("last_write_time", FileTime),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    file_read_attributes = 0x80
+    share_read_write = 0x1 | 0x2
+    open_existing = 3
+    backup_semantics = 0x02000000
+    open_reparse_point = 0x00200000
+    handle = create_file(
+        str(path),
+        (0x00010000 if delete_access else 0) | file_read_attributes,
+        share_read_write,
+        None,
+        open_existing,
+        backup_semantics | open_reparse_point,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(FileInformation)]
+    get_information.restype = wintypes.BOOL
+    information = FileInformation()
+    if not get_information(handle, ctypes.byref(information)):
+        error = ctypes.WinError(ctypes.get_last_error())
+        _close_windows_handle(handle)
+        raise error
+    directory_attribute = 0x10
+    reparse_attribute = 0x400
+    if not information.attributes & directory_attribute or (
+        information.attributes & reparse_attribute
+    ):
+        _close_windows_handle(handle)
+        raise ResearchCommitError("trusted directory cannot be a link or reparse point")
+    file_index = (information.file_index_high << 32) | information.file_index_low
+    return int(handle), file_index
+
+
+def _close_windows_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    close_handle = ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    close_handle(handle)
+
+
+def _entry_exists(directory: _BoundDirectory, name: str) -> bool:
+    try:
+        if directory.descriptor is not None:
+            metadata = os.stat(
+                name,
+                dir_fd=directory.descriptor,
+                follow_symlinks=False,
+            )
+            is_link = stat.S_ISLNK(metadata.st_mode)
+        else:
+            path = directory.path / name
+            metadata = path.lstat()
+            is_link = path.is_symlink() or _is_reparse_metadata(metadata)
+    except FileNotFoundError:
+        return False
+    if is_link or _is_reparse_metadata(metadata):
+        raise ResearchCommitError("trusted directory entry cannot be a link")
+    return True
+
+
+def _list_bound_entries(directory: _BoundDirectory) -> list[str]:
+    if directory.descriptor is not None:
+        return os.listdir(directory.descriptor)
+    return os.listdir(directory.path)
+
+
+def _read_bound_file(directory: _BoundDirectory, name: str) -> StableFile:
+    if directory.descriptor is None:
+        return stable_read_file(directory.path / name)
+    before = os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        raise StableReadError("bound file must be a regular non-link")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory.descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    current = os.stat(name, dir_fd=directory.descriptor, follow_symlinks=False)
+    expected = _stable_signature(before)
+    if any(
+        _stable_signature(value) != expected for value in (opened, after, current)
+    ):
+        raise StableReadError("bound file changed while being read")
+    data = b"".join(chunks)
+    return StableFile(data=data, sha256=f"sha256:{hashlib.sha256(data).hexdigest()}")
+
+
+def _unlink_bound(
+    directory: _BoundDirectory,
+    name: str,
+    *,
+    missing_ok: bool = False,
+) -> None:
+    try:
+        if directory.descriptor is not None:
+            os.unlink(name, dir_fd=directory.descriptor)
+            os.fsync(directory.descriptor)
+        else:
+            (directory.path / name).unlink()
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+
+
+def _stable_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _is_reparse_metadata(metadata: os.stat_result) -> bool:
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(attributes & reparse_flag)
 
 
 def _reject_link_components(path: Path) -> None:
@@ -773,8 +1308,19 @@ def _materialize_verified_snapshot(
             if path.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
             elif path.is_file():
+                before = path.stat(follow_symlinks=False)
                 value = _read_snapshot_file(path)
+                after = path.stat(follow_symlinks=False)
+                if (
+                    (before.st_dev, before.st_ino, before.st_mode, before.st_ctime_ns)
+                    != (after.st_dev, after.st_ino, after.st_mode, after.st_ctime_ns)
+                ):
+                    raise ResearchCommitError(
+                        "Run snapshot changed during materialization"
+                    )
                 atomic_write_bytes(target, value.data)
+                if os.name == "posix":
+                    target.chmod(stat.S_IMODE(after.st_mode))
         if hash_tree(destination) != expected_hash:
             raise ResearchCommitError("Run snapshot changed during materialization")
     except ResearchCommitError:
