@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import ValidationError
@@ -164,6 +164,76 @@ def test_findings_are_field_specific_and_stably_ordered() -> None:
     assert all(finding.field and finding.message for finding in first_report.findings)
 
 
+def test_nested_parameter_insertion_order_does_not_change_the_report() -> None:
+    """Catches nested adapter mappings leaking insertion order into the hash."""
+    first = load_case("exact")
+    second = load_case("exact")
+    first_method = first["method"]
+    second_method = second["method"]
+    assert isinstance(first_method, MethodSpec)
+    assert isinstance(second_method, MethodSpec)
+    first["method"] = first_method.model_copy(
+        update={
+            "input_requirements": {
+                "signal": {
+                    "field": "signal",
+                    "adaptation": "axis_transpose",
+                    "parameters": {
+                        "source_axes": ["batch", "time", "channel"],
+                        "target_axes": ["batch", "channel", "time"],
+                    },
+                }
+            }
+        }
+    )
+    second["method"] = second_method.model_copy(
+        update={
+            "input_requirements": {
+                "signal": {
+                    "field": "signal",
+                    "adaptation": "axis_transpose",
+                    "parameters": {
+                        "target_axes": ["batch", "channel", "time"],
+                        "source_axes": ["batch", "time", "channel"],
+                    },
+                }
+            }
+        }
+    )
+
+    first_report = compile_compatibility(**first)
+    second_report = compile_compatibility(**second)
+
+    assert first_report == second_report
+
+
+@pytest.mark.parametrize(
+    "requirement",
+    [
+        {"field": "signal", "normalization_fit_scope": "all_samples"},
+        {"field": "signal", "parameters": {"target_hz": 256}},
+    ],
+)
+def test_requirement_envelope_rejects_undeclared_semantics(
+    requirement: dict[str, object]
+) -> None:
+    """Catches semantic or parameter keys bypassing explicit adaptation review."""
+    case = load_case("exact")
+    method = case["method"]
+    assert isinstance(method, MethodSpec)
+    case["method"] = method.model_copy(
+        update={"input_requirements": {"signal": requirement}}
+    )
+
+    report = compile_compatibility(**case)
+
+    assert report.state is CompatibilityState.INCOMPATIBLE
+    assert any(
+        finding.field == "method.input_requirements.signal"
+        for finding in report.findings
+    )
+
+
 @pytest.mark.parametrize(
     ("kind", "parameters"),
     [
@@ -174,7 +244,7 @@ def test_findings_are_field_specific_and_stably_ordered() -> None:
                 "target_axes": ["batch", "channel", "time"],
             },
         ),
-        ("add_batch_dimension", {"axis": 0}),
+        ("add_batch_dimension", {"axis": "batch"}),
         (
             "safe_dtype_conversion",
             {"source_dtype": "float32", "target_dtype": "float64"},
@@ -220,6 +290,24 @@ def test_only_declared_mechanical_adapters_are_generated(
     assert report.state is CompatibilityState.ADAPTABLE
     assert [adapter.kind.value for adapter in adapters] == [kind]
     assert all(adapter.api_version == "ai4sota/v1" for adapter in adapters)
+
+
+def test_returned_adapter_parameters_are_deeply_immutable() -> None:
+    """Catches a caller mutating adapter semantics after the report is hashed."""
+    report = compile_compatibility(**load_case("axis_transpose"))
+    adapter = next(
+        adapter for finding in report.findings for adapter in finding.adapters
+    )
+    parameters = cast(Any, adapter.parameters)
+
+    with pytest.raises(TypeError):
+        parameters["source_axes"][0] = "frequency"
+    with pytest.raises(TypeError):
+        parameters["target_axes"] = ("time", "channel", "batch")
+
+    assert report.contract_hash == (
+        "sha256:2dc4f6be2a970bd92c596cd2a405e6a6337605de5cc4c971062d4cd4bdfd0b1b"
+    )
 
 
 @pytest.mark.parametrize(
@@ -370,6 +458,43 @@ def test_explicitly_unsupported_task_contract_is_incompatible() -> None:
     assert any(finding.field == "method.task_contracts" for finding in report.findings)
 
 
+def test_missing_method_task_capabilities_are_incompatible() -> None:
+    """Catches an empty task capability list being treated as an implicit wildcard."""
+    case = load_case("exact")
+    method = case["method"]
+    assert isinstance(method, MethodSpec)
+    case["method"] = method.model_copy(update={"task_contracts": ()})
+
+    report = compile_compatibility(**case)
+
+    assert report.state is CompatibilityState.INCOMPATIBLE
+    assert any(finding.field == "method.task_contracts" for finding in report.findings)
+
+
+@pytest.mark.parametrize("axis", ["", "   ", 0, -1, 99])
+def test_batch_dimension_requires_a_non_empty_semantic_axis(axis: object) -> None:
+    """Catches ambiguous or unbounded numeric Batch-axis declarations."""
+    case = load_case("exact")
+    method = case["method"]
+    assert isinstance(method, MethodSpec)
+    case["method"] = method.model_copy(
+        update={
+            "input_requirements": {
+                "signal": {
+                    "field": "signal",
+                    "adaptation": "add_batch_dimension",
+                    "parameters": {"axis": axis},
+                }
+            }
+        }
+    )
+
+    report = compile_compatibility(**case)
+
+    assert report.state is CompatibilityState.INCOMPATIBLE
+    assert not any(finding.adapters for finding in report.findings)
+
+
 def test_incompatible_dominates_a_scientific_decision() -> None:
     """Catches aggregate severity depending on rule or fixture ordering."""
     case = load_case("resample")
@@ -407,3 +532,30 @@ def test_compatibility_models_reject_unknown_fields() -> None:
             findings=(),
             contract_hash=CONTENT_HASH,
         )
+
+
+def test_report_rejects_tampered_aggregate_state() -> None:
+    """Catches deserialized reports whose verdict does not match their findings."""
+    document = compile_compatibility(**load_case("exact")).model_dump(mode="json")
+    document["state"] = CompatibilityState.INCOMPATIBLE
+
+    with pytest.raises(ValidationError, match="state"):
+        CompatibilityReport.model_validate(document)
+
+
+def test_report_rejects_tampered_contract_hash() -> None:
+    """Catches deserialized reports whose findings no longer match their hash."""
+    document = compile_compatibility(**load_case("exact")).model_dump(mode="json")
+    document["contract_hash"] = OTHER_HASH
+
+    with pytest.raises(ValidationError, match="contract_hash"):
+        CompatibilityReport.model_validate(document)
+
+
+def test_exact_report_hash_matches_an_independent_literal() -> None:
+    """Catches drift in canonical finding content or hash serialization."""
+    report = compile_compatibility(**load_case("exact"))
+
+    assert report.contract_hash == (
+        "sha256:1cc7c2df9fef7d7e3c1894aa852ec3f9b126aef2deb191870b8b4f12c6490202"
+    )

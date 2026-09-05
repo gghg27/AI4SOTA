@@ -16,6 +16,7 @@ from ai4sota.domain import (
 )
 
 from .models import (
+    STATE_RANK,
     AdapterKind,
     CompatibilityFinding,
     MechanicalAdapterSpec,
@@ -41,13 +42,6 @@ _DECISION_ADAPTATIONS = frozenset(
         "missing_values",
     }
 )
-
-_STATE_RANK = {
-    CompatibilityState.COMPATIBLE: 0,
-    CompatibilityState.ADAPTABLE: 1,
-    CompatibilityState.REQUIRES_DECISION: 2,
-    CompatibilityState.INCOMPATIBLE: 3,
-}
 
 _MECHANICAL_PARAMETER_KEYS = {
     AdapterKind.AXIS_TRANSPOSE: frozenset({"source_axes", "target_axes"}),
@@ -76,7 +70,7 @@ def evaluate_task_contracts(
         mismatches.append("data.task_contract_hash")
     if evaluation.task_contract_hash != task.content_hash:
         mismatches.append("evaluation.task_contract_hash")
-    if method.task_contracts and task.id not in method.task_contracts:
+    if task.id not in method.task_contracts:
         return CompatibilityFinding(
             rule="task_contract_identity",
             field="method.task_contracts",
@@ -149,7 +143,7 @@ def evaluate_method_inputs(
             state=CompatibilityState.COMPATIBLE,
             message="Method declares no required Data input fields.",
         )
-    state = max(states, key=_STATE_RANK.__getitem__)
+    state = max(states, key=STATE_RANK.__getitem__)
     return CompatibilityFinding(
         rule="method_inputs",
         field=next(
@@ -229,6 +223,18 @@ def _parse_requirement(
         return requirement_name, None, {}, "field must be a non-empty string"
     if not isinstance(requirement, Mapping):
         return requirement_name, None, {}, "requirement must be a field name or mapping"
+    unknown = sorted(
+        str(key)
+        for key in requirement
+        if key not in {"field", "adaptation", "parameters"}
+    )
+    if unknown:
+        return (
+            requirement_name,
+            None,
+            {},
+            f"requirement has unsupported keys: {', '.join(unknown)}",
+        )
     field = requirement.get("field", requirement_name)
     if not isinstance(field, str) or not field.strip():
         return requirement_name, None, {}, "field must be a non-empty string"
@@ -241,6 +247,8 @@ def _parse_requirement(
     parameters = json_parameters(raw_parameters)
     if parameters is None:
         return field, adaptation, {}, "parameters must contain JSON-compatible values"
+    if adaptation is None and parameters:
+        return field, None, {}, "parameters require an explicit adaptation"
     return field, adaptation, parameters, None
 
 
@@ -305,10 +313,10 @@ def _validate_mechanical_adapter(
             )
     elif kind is AdapterKind.ADD_BATCH_DIMENSION:
         axis = parameters.get("axis")
-        if not isinstance(axis, (int, str)) or isinstance(axis, bool):
+        if not _non_empty_string(axis) or str(axis).strip().casefold() != "batch":
             return (
                 CompatibilityState.INCOMPATIBLE,
-                "add_batch_dimension requires an integer or semantic axis",
+                "add_batch_dimension requires the semantic axis 'batch'",
             )
     elif kind is AdapterKind.SAFE_DTYPE_CONVERSION:
         source = parameters.get("source_dtype")
