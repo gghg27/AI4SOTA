@@ -4,8 +4,15 @@ from pathlib import Path
 
 import pytest
 
+import ai4sota.files.patches as patches_module
 from ai4sota.files.hashing import sha256_file
-from ai4sota.files.patches import PatchConflict, PatchSet, PatchTarget, apply_patch_set
+from ai4sota.files.patches import (
+    PatchConflict,
+    PatchSet,
+    PatchTarget,
+    PatchValidationError,
+    apply_patch_set,
+)
 
 
 def write(path: Path, content: str) -> Path:
@@ -21,7 +28,11 @@ def test_stale_second_target_prevents_every_write(tmp_path: Path) -> None:
     patch = PatchSet(
         targets=[
             PatchTarget(path="a.py", expected_sha256=sha256_file(first), content="new-a"),
-            PatchTarget(path="b.py", expected_sha256="0" * 64, content="new-b"),
+            PatchTarget(
+                path="b.py",
+                expected_sha256="sha256:" + "0" * 64,
+                content="new-b",
+            ),
         ]
     )
 
@@ -31,6 +42,105 @@ def test_stale_second_target_prevents_every_write(tmp_path: Path) -> None:
     assert error.value.paths == ("b.py",)
     assert first.read_text(encoding="utf-8") == "old-a"
     assert second.read_text(encoding="utf-8") == "old-b"
+
+
+@pytest.mark.parametrize(
+    "expected_sha256",
+    [
+        "sha1:" + "0" * 64,
+        "sha256:" + "A" * 64,
+        "sha256:" + "0" * 63,
+        "sha256:" + "g" + "0" * 63,
+    ],
+)
+def test_malformed_expected_hash_fails_before_filesystem_access(
+    tmp_path: Path, expected_sha256: str
+) -> None:
+    """Catches malformed hash input reaching root resolution or file operations."""
+    patch = PatchSet(
+        targets=[
+            PatchTarget(
+                path="missing.py",
+                expected_sha256=expected_sha256,
+                content="new",
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="expected SHA-256"):
+        apply_patch_set(tmp_path / "missing-root", patch)
+
+
+def test_duplicate_canonical_targets_fail_before_hashing_or_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches duplicate target spellings reaching hash checks or replacement."""
+    target = write(tmp_path / "a.py", "old")
+    patch = PatchSet(
+        targets=[
+            PatchTarget(
+                path="a.py",
+                expected_sha256="sha256:" + "0" * 64,
+                content="first",
+            ),
+            PatchTarget(
+                path="./a.py",
+                expected_sha256="sha256:" + "0" * 64,
+                content="second",
+            ),
+        ]
+    )
+
+    def hash_must_not_run(path: Path) -> str:
+        pytest.fail(f"duplicate target reached hash check: {path}")
+
+    monkeypatch.setattr(patches_module, "sha256_file", hash_must_not_run)
+
+    with pytest.raises(PatchValidationError, match="duplicate"):
+        apply_patch_set(tmp_path, patch)
+
+    assert target.read_text(encoding="utf-8") == "old"
+
+
+def test_regular_file_project_root_is_rejected_before_path_operations(
+    tmp_path: Path,
+) -> None:
+    """Catches a regular file root leaking a low-level path error."""
+    root = write(tmp_path / "not-a-directory", "root")
+    patch = PatchSet(
+        targets=[
+            PatchTarget(
+                path="a.py",
+                expected_sha256="sha256:" + "0" * 64,
+                content="new",
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="existing directory"):
+        apply_patch_set(root, patch)
+
+
+@pytest.mark.parametrize("path", [".", "./"])
+def test_project_root_target_is_rejected_before_hashing(
+    tmp_path: Path, path: str
+) -> None:
+    """Catches a target that denotes the project directory rather than a file."""
+    sentinel = write(tmp_path / "sentinel.py", "old")
+    patch = PatchSet(
+        targets=[
+            PatchTarget(
+                path=path,
+                expected_sha256="sha256:" + "0" * 64,
+                content="new",
+            )
+        ]
+    )
+
+    with pytest.raises(PatchValidationError, match="project root"):
+        apply_patch_set(tmp_path, patch)
+
+    assert sentinel.read_text(encoding="utf-8") == "old"
 
 
 def test_sha256_file_returns_a_canonical_digest(tmp_path: Path) -> None:

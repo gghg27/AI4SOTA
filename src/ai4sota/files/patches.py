@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,8 @@ from pathlib import Path
 from ai4sota.storage.atomic import atomic_write_bytes
 
 from .hashing import sha256_file
+
+_SHA256_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 @dataclass(frozen=True)
@@ -42,22 +45,47 @@ class PatchConflict(Exception):
         super().__init__(f"patch conflicts: {', '.join(paths)}")
 
 
+class PatchValidationError(ValueError):
+    """Raised when a patch request is invalid before file access is safe."""
+
+
 def apply_patch_set(project_root: Path, patch_set: PatchSet) -> AppliedPatch:
     """Replace all patch targets only when every expected hash still matches."""
-    resolved = [
-        _resolve_inside(project_root, target.path) for target in patch_set.targets
-    ]
+    targets = tuple(patch_set.targets)
+    _validate_expected_hashes(targets)
+    root = _resolve_project_root(project_root)
+    resolved = [_resolve_inside(root, target.path) for target in targets]
+    _reject_duplicate_paths(resolved)
     conflicts = tuple(
         target.path
-        for target, path in zip(patch_set.targets, resolved, strict=True)
+        for target, path in zip(targets, resolved, strict=True)
         if _is_conflicted(path, target.expected_sha256)
     )
     if conflicts:
         raise PatchConflict(conflicts)
 
-    for target, path in zip(patch_set.targets, resolved, strict=True):
+    for target, path in zip(targets, resolved, strict=True):
         atomic_write_bytes(path, target.content.encode("utf-8"))
-    return AppliedPatch(paths=tuple(target.path for target in patch_set.targets))
+    return AppliedPatch(paths=tuple(target.path for target in targets))
+
+
+def _validate_expected_hashes(targets: Sequence[PatchTarget]) -> None:
+    invalid_paths = tuple(
+        target.path
+        for target in targets
+        if _SHA256_PATTERN.fullmatch(target.expected_sha256) is None
+    )
+    if invalid_paths:
+        raise PatchValidationError(
+            f"invalid expected SHA-256 for patch targets: {', '.join(invalid_paths)}"
+        )
+
+
+def _resolve_project_root(project_root: Path) -> Path:
+    root = project_root.resolve(strict=False)
+    if not root.is_dir():
+        raise PatchValidationError("project root must be an existing directory")
+    return root
 
 
 def _is_conflicted(path: Path, expected_sha256: str) -> bool:
@@ -67,16 +95,27 @@ def _is_conflicted(path: Path, expected_sha256: str) -> bool:
         return True
 
 
-def _resolve_inside(project_root: Path, relative_path: str) -> Path:
-    root = project_root.resolve(strict=True)
+def _resolve_inside(root: Path, relative_path: str) -> Path:
     target = Path(relative_path)
     if target.is_absolute() or target.drive:
-        raise ValueError(f"patch path must be relative: {relative_path}")
+        raise PatchValidationError(f"patch path must be relative: {relative_path}")
 
     candidate = root / target
     resolved = candidate.resolve(strict=False)
     try:
         resolved.relative_to(root)
     except ValueError as error:
-        raise ValueError(f"patch path escapes project root: {relative_path}") from error
+        raise PatchValidationError(
+            f"patch path escapes project root: {relative_path}"
+        ) from error
+    if resolved == root:
+        raise PatchValidationError(f"patch path cannot be the project root: {relative_path}")
     return candidate
+
+
+def _reject_duplicate_paths(paths: Sequence[Path]) -> None:
+    seen: set[Path] = set()
+    for path in paths:
+        if path in seen:
+            raise PatchValidationError(f"duplicate patch target: {path}")
+        seen.add(path)
