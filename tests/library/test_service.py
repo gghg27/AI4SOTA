@@ -1,13 +1,26 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
+from typing import TypeVar
 
 import pytest
+from pydantic import BaseModel
 
-from ai4sota.domain import DataModuleSpec
+import ai4sota.library.service as library_service
+from ai4sota.domain import (
+    DataModuleSpec,
+    DatasetSourceSpec,
+    EvaluationSpec,
+    MethodSpec,
+    PreprocessingSpec,
+)
+from ai4sota.domain.common import OriginSpec, OriginType
+from ai4sota.domain.modules import MetricSpec, SplitProtocolSpec
 from ai4sota.library import (
     LibraryValidationError,
     ModuleDraft,
@@ -18,6 +31,8 @@ from ai4sota.library import (
 )
 from ai4sota.projects import ProjectLayout
 from ai4sota.storage import ManifestStore, canonical_manifest_hash
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 def _data_module(version: str) -> DataModuleSpec:
@@ -39,12 +54,89 @@ def _data_module(version: str) -> DataModuleSpec:
     return draft.model_copy(update={"content_hash": canonical_manifest_hash(draft)})
 
 
+def _with_content_hash(model: ModelT) -> ModelT:
+    return model.model_copy(update={"content_hash": canonical_manifest_hash(model)})
+
+
+def _dataset_source() -> DatasetSourceSpec:
+    return _with_content_hash(
+        DatasetSourceSpec(
+            id="dataset/seed",
+            version="1.0.0",
+            content_hash="sha256:" + "0" * 64,
+            name="Seed dataset",
+            locations=("data/seed.edf",),
+            sampling_rate_hz=200,
+            metadata_fields=("subject_id",),
+            fingerprint_hash="sha256:" + "b" * 64,
+        )
+    )
+
+
+def _preprocessing() -> PreprocessingSpec:
+    return _with_content_hash(
+        PreprocessingSpec(
+            id="preprocessing/seed",
+            version="1.0.0",
+            content_hash="sha256:" + "0" * 64,
+            transforms=(),
+            graph_hash="sha256:" + "c" * 64,
+        )
+    )
+
+
 def valid_draft(root: Path, module_id: str, version: str) -> ModuleDraft:
     path = root / "drafts" / module_id.replace("/", "-") / version
     path.mkdir(parents=True)
     ManifestStore().write(path / "module.yaml", _data_module(version))
+    ManifestStore().write(path / "dataset.yaml", _dataset_source())
+    ManifestStore().write(path / "preprocessing.yaml", _preprocessing())
     (path / "adapter.py").write_text("def load():\n    return None\n", encoding="utf-8")
     return ModuleDraft(path=path, module_id=module_id, version=version)
+
+
+def valid_method_draft(root: Path, version: str) -> ModuleDraft:
+    path = root / "method-draft" / version
+    path.mkdir(parents=True)
+    module = MethodSpec(
+        id="method/seed",
+        version=version,
+        content_hash="sha256:" + "0" * 64,
+        origin=OriginSpec(type=OriginType.PROJECT),
+        framework="numpy",
+        entrypoint="model:train",
+        input_requirements={"layout": "batch,time,channel"},
+        output_capabilities=("logits",),
+    )
+    ManifestStore().write(path / "module.yaml", _with_content_hash(module))
+    return ModuleDraft(path=path, module_id="method/seed", version=version)
+
+
+def valid_evaluation_draft(root: Path, version: str) -> ModuleDraft:
+    path = root / "evaluation-draft" / version
+    path.mkdir(parents=True)
+    module = EvaluationSpec(
+        id="evaluation/seed",
+        version=version,
+        content_hash="sha256:" + "0" * 64,
+        origin=OriginSpec(type=OriginType.PROJECT),
+        entrypoint="evaluator:run",
+        task_contract="task/emotion",
+        task_contract_hash="sha256:" + "a" * 64,
+        required_predictions=("logits",),
+        protocol=SplitProtocolSpec(kind="group_holdout", group_by="subject_id"),
+        metrics=(MetricSpec(name="accuracy", primary=True, implementation="metric:run"),),
+    )
+    ManifestStore().write(path / "module.yaml", _with_content_hash(module))
+    return ModuleDraft(path=path, module_id="evaluation/seed", version=version)
+
+
+def rewrite_data_module(path: Path, **updates: object) -> DataModuleSpec:
+    current = ManifestStore().read(path, DataModuleSpec)
+    draft = current.model_copy(update={**updates, "content_hash": "sha256:" + "0" * 64})
+    updated = draft.model_copy(update={"content_hash": canonical_manifest_hash(draft)})
+    ManifestStore().write(path, updated)
+    return updated
 
 
 def make_directory_link(link: Path, target: Path) -> None:
@@ -151,7 +243,7 @@ def test_import_rejects_a_linked_project_module_directory(tmp_path: Path) -> Non
     outside.mkdir()
     make_directory_link(target, outside)
 
-    with pytest.raises(LibraryValidationError, match="real directory"):
+    with pytest.raises(LibraryValidationError, match="link or reparse"):
         library.import_version(published.ref, project)
 
     assert list(outside.iterdir()) == []
@@ -227,3 +319,161 @@ def test_failed_publication_cleans_up_its_staging_tree(tmp_path: Path) -> None:
     assert not (destination_parent / "1.0.0").exists()
     assert list(destination_parent.glob(".*.staging")) == []
     assert list((library.root / ".locks" / "data" / "seed").glob("*.lock")) == []
+
+
+def test_read_and_import_reject_a_tampered_published_payload(tmp_path: Path) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+    (published.path / "adapter.py").write_text("TAMPERED = True\n", encoding="utf-8")
+    project = ProjectLayout.create(tmp_path, "seed-project")
+
+    with pytest.raises(LibraryValidationError, match="publication integrity"):
+        library.read(published.ref)
+    with pytest.raises(LibraryValidationError, match="publication integrity"):
+        library.import_version(published.ref, project)
+
+
+def test_import_uses_verified_staged_bytes_when_source_changes_during_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+    project = ProjectLayout.create(tmp_path, "seed-project")
+    real_copy = library_service._copy_tree
+
+    def copy_then_tamper(source: Path, destination: Path) -> None:
+        real_copy(source, destination)
+        if source == published.path:
+            (source / "adapter.py").write_text("RACED = True\n", encoding="utf-8")
+
+    monkeypatch.setattr(library_service, "_copy_tree", copy_then_tamper)
+
+    imported = library.import_version(published.ref, project)
+
+    assert (imported / "adapter.py").read_text(encoding="utf-8") == (
+        "def load():\n    return None\n"
+    )
+    with pytest.raises(LibraryValidationError, match="publication integrity"):
+        library.read(published.ref)
+
+
+def test_publish_requires_data_references_to_existing_matching_manifests(
+    tmp_path: Path,
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    (draft.path / "dataset.yaml").unlink()
+
+    with pytest.raises(LibraryValidationError, match="dataset source"):
+        library.publish(draft, expected_hash=hash_tree(draft.path))
+
+    draft = valid_draft(tmp_path / "mismatch", "data/seed", "1.0.1")
+    rewrite_data_module(draft.path / "module.yaml", source="preprocessing.yaml")
+    with pytest.raises(LibraryValidationError, match="dataset source"):
+        library.publish(draft, expected_hash=hash_tree(draft.path))
+
+
+def test_publish_rejects_data_references_that_escape_the_module_tree(
+    tmp_path: Path,
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    rewrite_data_module(draft.path / "module.yaml", source="../dataset.yaml")
+
+    with pytest.raises(LibraryValidationError, match="canonical in-tree"):
+        library.publish(draft, expected_hash=hash_tree(draft.path))
+
+
+def test_publish_requires_method_and_evaluation_executables_in_tree(
+    tmp_path: Path,
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    method = valid_method_draft(tmp_path, "1.0.0")
+    evaluation = valid_evaluation_draft(tmp_path, "1.0.0")
+
+    with pytest.raises(LibraryValidationError, match="entrypoint"):
+        library.publish(method, expected_hash=hash_tree(method.path))
+    with pytest.raises(LibraryValidationError, match="entrypoint"):
+        library.publish(evaluation, expected_hash=hash_tree(evaluation.path))
+
+    (evaluation.path / "evaluator.py").write_text("def run():\n    return None\n", encoding="utf-8")
+    with pytest.raises(LibraryValidationError, match="metric implementation"):
+        library.publish(evaluation, expected_hash=hash_tree(evaluation.path))
+
+
+def test_publish_rejects_a_library_root_with_a_reparse_ancestor(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    redirected = tmp_path / "redirected"
+    make_directory_link(redirected, outside)
+    library = ModuleLibrary(redirected / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+
+    with pytest.raises(LibraryValidationError, match="link or reparse"):
+        library.publish(draft, expected_hash=hash_tree(draft.path))
+
+    assert not (outside / "library").exists()
+
+
+def test_import_rejects_a_project_module_ancestor_reparse_point(tmp_path: Path) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+    project = ProjectLayout.create(tmp_path, "seed-project")
+    modules = project.root / "modules"
+    outside = tmp_path / "outside-modules"
+    outside.mkdir()
+    shutil.rmtree(modules)
+    (outside / "data" / "current").mkdir(parents=True)
+    make_directory_link(modules, outside)
+
+    with pytest.raises(LibraryValidationError, match="link or reparse"):
+        library.import_version(published.ref, project)
+
+    assert list((outside / "data" / "current").iterdir()) == []
+
+
+def test_import_restores_the_original_current_directory_after_rename_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+    project = ProjectLayout.create(tmp_path, "seed-project")
+    target = project.module_dir("data")
+    real_replace = library_service.durable_replace
+
+    def fail_staged_import(source: Path, destination: Path) -> None:
+        if source.name.endswith(".staging") and destination == target:
+            raise OSError("simulated import rename failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(library_service, "durable_replace", fail_staged_import)
+
+    with pytest.raises(OSError, match="simulated import rename failure"):
+        library.import_version(published.ref, project)
+
+    assert target.is_dir()
+    assert list(target.iterdir()) == []
+
+
+def test_retry_recovers_a_subprocess_interrupted_publication(tmp_path: Path) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    staging = library.root / "data" / "seed" / ".1.0.0.dead.staging"
+    lock = library.root / ".locks" / "data" / "seed" / "1.0.0.lock"
+    script = (
+        "from pathlib import Path; "
+        f"Path({str(staging)!r}).mkdir(parents=True); "
+        f"Path({str(lock)!r}).parent.mkdir(parents=True); "
+        f"Path({str(lock)!r}).write_text('dead', encoding='utf-8')"
+    )
+    subprocess.run([sys.executable, "-c", script], check=True)
+
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+
+    assert published.ref == "data/seed@1.0.0"
+    assert not staging.exists()
+    assert not lock.exists()
