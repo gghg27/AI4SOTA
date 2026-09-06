@@ -22,6 +22,7 @@ from ai4sota.domain import (
 from ai4sota.files.hashing import sha256_file
 from ai4sota.projects import ProjectLayout
 from ai4sota.runs import (
+    AggregationError,
     SnapshotValidationError,
     aggregate_runs,
     hash_tree,
@@ -511,33 +512,46 @@ def test_prepare_run_persists_the_approved_repetition_seed(
     ).seed == 17
 
 
-def test_prepared_run_repetition_seeds_aggregate_without_changing_the_snapshot(
+def test_prepare_run_rejects_a_seed_outside_the_approved_experiment(
     runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
 ) -> None:
-    """Catches seed repetitions altering the immutable approved input snapshot."""
+    """Catches execution coordinates bypassing the approved immutable seed."""
+    project, experiment, _ = runnable_project
+    with pytest.raises(SnapshotValidationError, match="approved.*seed"):
+        prepare_run(project, experiment, repetition_seed=7)
+    assert list(project.runs_dir.iterdir()) == []
+
+
+def test_prepared_repetitions_preserve_the_approved_seed_and_snapshot(
+    runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
+) -> None:
+    """Catches matching overrides changing approval or inventing distinct seeds."""
     project, experiment, _ = runnable_project
 
-    first = prepare_run(project, experiment, repetition_seed=7)
+    first = prepare_run(project, experiment)
     second = prepare_run(project, experiment, repetition_seed=17)
     completed = [
         _completed_run(first, macro_f1=0.8),
         _completed_run(second, macro_f1=0.82),
     ]
 
-    result = aggregate_runs(completed, dimensions={"seed"})
+    with pytest.raises(AggregationError, match="duplicate repetition coordinates"):
+        aggregate_runs(completed, dimensions={"seed"})
 
     assert first.snapshot_hash == second.snapshot_hash
     assert first.experiment_hash == second.experiment_hash == experiment.content_hash
-    assert (first.seed, second.seed) == (7, 17)
+    assert (first.seed, second.seed) == (17, 17)
     assert ManifestStore().read(
         project.runs_dir / first.id / "manifest.yaml", RunManifest
-    ).seed == 7
+    ).seed == 17
+    assert ManifestStore().read(
+        project.runs_dir / first.id / "snapshot" / "experiment.yaml", ExperimentSpec
+    ) == experiment
     first_event = json.loads(
         (project.runs_dir / first.id / "events.jsonl").read_text(encoding="utf-8")
     )
     assert first_event["details"]["approval_id"] == experiment.approval_id
-    assert first_event["details"]["repetition_coordinates"] == {"seed": 7}
-    assert result.metrics["macro_f1"].mean == pytest.approx(0.81)
+    assert first_event["details"]["repetition_coordinates"] == {"seed": 17}
 
 
 def _completed_run(manifest: RunManifest, *, macro_f1: float) -> RunManifest:

@@ -74,8 +74,18 @@ class RunRepository:
     ) -> RunManifest:
         return record_run_metrics(self.run_dir(run_id), metrics)
 
-    def fail_run(self, run_id: str) -> RunManifest:
-        return fail_run(self.run_dir(run_id))
+    def fail_run(
+        self, run_id: str, *, integrity_anomaly: str | None = None
+    ) -> RunManifest:
+        return fail_run(self.run_dir(run_id), integrity_anomaly=integrity_anomaly)
+
+    def interrupt_run(self, run_id: str) -> RunManifest:
+        directory = self.run_dir(run_id)
+        with _exclusive_run_lock(directory):
+            current = _recover_pending_facts(directory, load_run_manifest(directory))
+            if current.status == "interrupted":
+                return current
+            return _transition_current_locked(directory, current, "interrupted")
 
 
 def load_run_manifest(run_dir: Path) -> RunManifest:
@@ -208,7 +218,7 @@ def transition_run(run_dir: Path, expected: str, target: str) -> RunManifest:
         return _transition_current_locked(directory, current, target)
 
 
-def fail_run(run_dir: Path) -> RunManifest:
+def fail_run(run_dir: Path, *, integrity_anomaly: str | None = None) -> RunManifest:
     """Recover durable facts and atomically publish an active Run as failed."""
     directory = Path(run_dir)
     if not directory.is_dir():
@@ -222,7 +232,9 @@ def fail_run(run_dir: Path) -> RunManifest:
                 "Run state conflict: expected 'preparing' or 'running', "
                 f"found {current.status!r}"
             )
-        return _transition_current_locked(directory, current, "failed")
+        return _transition_current_locked(
+            directory, current, "failed", integrity_anomaly=integrity_anomaly
+        )
 
 
 def _recover_pending_facts(run_dir: Path, current: RunManifest) -> RunManifest:
@@ -239,7 +251,11 @@ def _recover_pending_facts(run_dir: Path, current: RunManifest) -> RunManifest:
 
 
 def _transition_current_locked(
-    directory: Path, current: RunManifest, target: str
+    directory: Path,
+    current: RunManifest,
+    target: str,
+    *,
+    integrity_anomaly: str | None = None,
 ) -> RunManifest:
     allowed = ALLOWED_TRANSITIONS.get(current.status, frozenset())
     if target not in allowed:
@@ -250,6 +266,15 @@ def _transition_current_locked(
         verify_run_integrity(directory)
 
     draft = current.model_copy(update={"status": target})
+    anomaly_details: dict[str, object] = {}
+    if integrity_anomaly is not None:
+        if target != "failed" or not integrity_anomaly.strip():
+            raise ValueError("an integrity anomaly requires a failed Run and reason")
+        draft = draft.model_copy(update={"integrity_state": "anomalous"})
+        anomaly_details = {
+            "integrity_anomaly": integrity_anomaly,
+            "source_integrity_state": current.integrity_state,
+        }
     updated = draft.model_copy(
         update={"content_hash": canonical_manifest_hash(draft)}
     )
@@ -261,6 +286,7 @@ def _transition_current_locked(
         previous_status=current.status,
         status=target,
         details={
+            **anomaly_details,
             "source_manifest_hash": current.content_hash,
             "target_manifest_hash": updated.content_hash,
             "target_manifest": updated.model_dump(mode="json"),
@@ -428,7 +454,21 @@ def _event_target_manifest(event: RunEvent, directory_name: str) -> RunManifest 
             "transition event does not describe a legal lifecycle transition"
         )
     source_hash = event.details.get("source_manifest_hash")
-    source = target.model_copy(update={"status": previous_status})
+    source_updates: dict[str, object] = {"status": previous_status}
+    if "integrity_anomaly" in event.details:
+        reason = event.details["integrity_anomaly"]
+        source_integrity = event.details.get("source_integrity_state")
+        if (
+            target.status != "failed"
+            or target.integrity_state != "anomalous"
+            or not isinstance(reason, str)
+            or not reason.strip()
+            or not isinstance(source_integrity, str)
+            or not source_integrity.strip()
+        ):
+            raise RunManifestIntegrityError("invalid integrity anomaly transition")
+        source_updates["integrity_state"] = source_integrity
+    source = target.model_copy(update=source_updates)
     if not isinstance(source_hash, str) or canonical_manifest_hash(source) != source_hash:
         raise RunManifestIntegrityError(
             "transition event source manifest hash is inconsistent"
@@ -447,12 +487,13 @@ def _validate_pending_transition(
         raise RunManifestIntegrityError(
             "transition event previous status does not match its source manifest"
         )
-    current_projection = current.model_dump(
-        mode="json", exclude={"content_hash", "status"}
-    )
-    target_projection = target.model_dump(
-        mode="json", exclude={"content_hash", "status"}
-    )
+    excluded = {"content_hash", "status"}
+    if "integrity_anomaly" in event.details:
+        if event.details.get("source_integrity_state") != current.integrity_state:
+            raise RunManifestIntegrityError("integrity anomaly source is inconsistent")
+        excluded.add("integrity_state")
+    current_projection = current.model_dump(mode="json", exclude=excluded)
+    target_projection = target.model_dump(mode="json", exclude=excluded)
     if target_projection != current_projection:
         raise RunManifestIntegrityError(
             "transition event projection changes fields other than status"

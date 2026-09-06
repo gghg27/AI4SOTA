@@ -16,8 +16,8 @@ from ai4sota.storage import atomic_write_bytes
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "draft": frozenset({"awaiting_approval"}),
     "awaiting_approval": frozenset({"queued", "cancelled"}),
-    "queued": frozenset({"preparing", "cancelled"}),
-    "preparing": frozenset({"running", "failed", "cancelled"}),
+    "queued": frozenset({"preparing", "cancelled", "interrupted"}),
+    "preparing": frozenset({"running", "failed", "cancelled", "interrupted"}),
     "running": frozenset({"succeeded", "failed", "cancelled", "interrupted"}),
 }
 TERMINAL_STATES = frozenset({"succeeded", "failed", "cancelled", "interrupted"})

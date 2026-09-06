@@ -196,7 +196,9 @@ def test_phase1_migration_registry_produces_valid_v1_manifests(
 
     assert plan.diff
     assert backup.read_bytes() == original
-    assert ManifestStore().read(path, model).api_version == "ai4sota/v1"
+    persisted = ManifestStore().read(path, model)
+    assert persisted.api_version == "ai4sota/v1"
+    assert persisted.content_hash == canonical_manifest_hash(persisted)
 
 
 def test_phase1_module_migration_preserves_a_cross_module_field_contract(

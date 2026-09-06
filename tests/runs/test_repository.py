@@ -465,6 +465,29 @@ def test_fail_run_recovers_pending_metrics_before_terminal_transition(
     assert load_run_manifest(run_dir) == failed
 
 
+def test_integrity_anomaly_recovers_from_its_durable_terminal_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a failed manifest write losing the integrity anomaly on recovery."""
+    run_dir = tmp_path / "run-001"
+    make_run(run_dir, status="running")
+    real_write = ManifestStore.write
+
+    def fail_projection(store: ManifestStore, path: Path, value: object) -> None:
+        raise OSError("injected anomaly projection failure")
+
+    monkeypatch.setattr(ManifestStore, "write", fail_projection)
+    with pytest.raises(RunPersistenceError, match="manifest projection"):
+        fail_run(run_dir, integrity_anomaly="external dataset fingerprint changed")
+    monkeypatch.setattr(ManifestStore, "write", real_write)
+    failed = fail_run(run_dir)
+    assert failed.status == "failed"
+    assert failed.integrity_state == "anomalous"
+    assert load_run_manifest(run_dir) == failed
+    events = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(events) == 1
+
+
 @pytest.mark.parametrize(
     ("previous_status", "target_status", "target_updates"),
     [

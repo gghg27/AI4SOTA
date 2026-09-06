@@ -56,6 +56,18 @@ def test_different_test_members_suppress_delta_language() -> None:
     assert "split_manifest_hash" in report.blocking_fields
 
 
+def test_matching_integrity_anomalies_never_authorize_comparison() -> None:
+    """Catches equal nonverified states passing the field-difference gate."""
+    runs = [
+        make_run(name).model_copy(update={"integrity_state": "anomalous"})
+        for name in ("run-a", "run-b")
+    ]
+    report = compare_runs(runs)
+    assert report.state is ComparabilityState.NONE
+    assert report.metric_deltas is None
+    assert "integrity_state" in report.blocking_fields
+
+
 def test_repetition_coordinate_difference_is_reported_as_a_caveat() -> None:
     """Catches seed variation being mislabeled as a fully direct comparison."""
     report = compare_runs(

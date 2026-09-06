@@ -5,7 +5,6 @@ import io
 import json
 import random
 import re
-import sys
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -37,7 +36,7 @@ from .files import (
     stable_read_file,
 )
 from .io_utils import read_json, read_yaml, utc_now, write_json
-from .loading import load_project_module, require_callable
+from .loading import load_project_module, require_callable, snapshot_module_context
 from .project import resolve_project
 from .projects import ProjectLayout
 from .runs import (
@@ -60,6 +59,10 @@ __all__ = [
 _ENTRYPOINT_PATTERN = re.compile(
     r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
 )
+
+
+class ExternalDataIntegrityError(ValueError):
+    """The external dataset no longer verifies against the approved fingerprint."""
 
 
 def run_project(project_path: Path, note: str = "") -> dict[str, Any]:
@@ -239,6 +242,7 @@ def execute_run(project: ProjectLayout, run_id: str) -> RunManifest:
                     )
                 result.validate()
 
+            _verify_snapshot_dataset_fingerprint(snapshot, project.root, running)
             atomic_write_bytes(
                 run_dir / "metrics" / "metrics.json",
                 _json_bytes(result.metrics),
@@ -262,7 +266,7 @@ def execute_run(project: ProjectLayout, run_id: str) -> RunManifest:
                     run_id, "running", "succeeded"
                 )
         return completed
-    except Exception as error:
+    except (Exception, KeyboardInterrupt) as error:
         traceback.print_exc(file=logs)
         bookkeeping_errors: list[str] = []
         try:
@@ -273,7 +277,15 @@ def execute_run(project: ProjectLayout, run_id: str) -> RunManifest:
         except Exception as bookkeeping_error:  # noqa: BLE001
             bookkeeping_errors.append(f"worker log: {bookkeeping_error}")
         try:
-            repository.fail_run(run_id)
+            if isinstance(error, KeyboardInterrupt):
+                try:
+                    repository.interrupt_run(run_id)
+                except RunPersistenceError:
+                    repository.interrupt_run(run_id)
+            elif isinstance(error, ExternalDataIntegrityError):
+                repository.fail_run(run_id, integrity_anomaly=str(error))
+            else:
+                repository.fail_run(run_id)
         except Exception as bookkeeping_error:  # noqa: BLE001
             bookkeeping_errors.append(f"failure state: {bookkeeping_error}")
         message = f"run failed; details saved in {run_dir}"
@@ -281,6 +293,10 @@ def execute_run(project: ProjectLayout, run_id: str) -> RunManifest:
             message += "; failure bookkeeping incomplete: " + "; ".join(
                 bookkeeping_errors
             )
+        if isinstance(error, KeyboardInterrupt):
+            if bookkeeping_errors:
+                error.add_note(message)
+            raise
         raise RuntimeError(message) from error
 
 
@@ -328,13 +344,12 @@ def _snapshot_callable(
         raise ValueError(f"invalid {role} entrypoint: {entrypoint!r}")
     relative = Path(*parts[0].split(".")).with_suffix(".py")
     module_root = snapshot / "modules" / kind.value / "current"
-    previous = sys.dont_write_bytecode
-    sys.dont_write_bytecode = True
-    try:
-        module = load_project_module(module_root, relative.as_posix(), role)
-    finally:
-        sys.dont_write_bytecode = previous
-    return require_callable(module, parts[1], role)
+
+    def invoke(*args: Any, **kwargs: Any) -> Any:
+        with snapshot_module_context(module_root, relative.as_posix()) as module:
+            return require_callable(module, parts[1], role)(*args, **kwargs)
+
+    return invoke
 
 
 def _module_config(snapshot: Path, kind: ModuleKind) -> dict[str, Any]:
@@ -383,9 +398,12 @@ def _verify_snapshot_dataset_fingerprint(
     if len(source.locations) != 1:
         raise ValueError("Run requires exactly one external dataset location")
     location = resolve_file_location(project_root, source.locations[0])
-    actual = stable_read_file(location).sha256
+    try:
+        actual = stable_read_file(location).sha256
+    except (OSError, StableReadError) as error:
+        raise ExternalDataIntegrityError("external dataset cannot be verified") from error
     if actual != run.data_fingerprint_hash:
-        raise ValueError(
+        raise ExternalDataIntegrityError(
             f"external dataset fingerprint changed: expected "
             f"{run.data_fingerprint_hash}, found {actual}"
         )

@@ -733,6 +733,128 @@ def test_runner_uses_the_immutable_snapshot_and_persists_lifecycle_metrics(
     ]
 
 
+@pytest.mark.parametrize("change", ["replace", "delete"])
+def test_external_data_change_during_execution_records_integrity_anomaly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    """Catches changed external data being published as a verified success."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    approval = bind_experiment_approval(prepare_experiment(project), "approval/data")
+    queued = prepare_run(project, approval.experiment)
+    real_load = runner_module.load_snapshot_dataset
+
+    def load_then_change(snapshot: Path):
+        dataset = real_load(snapshot)
+        raw = tmp_path / "demo-dataset.npz"
+        if change == "replace":
+            raw.write_bytes(b"changed after loading")
+        else:
+            raw.unlink()
+        return dataset
+
+    monkeypatch.setattr(runner_module, "load_snapshot_dataset", load_then_change)
+    with pytest.raises(RuntimeError, match="run failed"):
+        execute_run(project, queued.id)
+
+    stored = RunRepository(project).load(queued.id)
+    assert stored.status == "failed"
+    assert stored.integrity_state == "anomalous"
+    run_dir = project.runs_dir / queued.id
+    events = [
+        json.loads(line)
+        for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-1]["details"]["integrity_anomaly"]
+    assert "external dataset" in (run_dir / "logs" / "worker.log").read_text(
+        encoding="utf-8"
+    )
+    report = compare_runs([stored, stored.model_copy(update={"id": "another-run"})])
+    assert report.state is ComparabilityState.NONE
+    assert "integrity_state" in report.blocking_fields
+    with pytest.raises(ValueError, match="succeeded and verified"):
+        create_research_commit(project, {"id": "rejected"}, [stored.id])
+
+
+@pytest.mark.parametrize("relative", [False, True], ids=["sibling", "relative"])
+@pytest.mark.parametrize("lazy", [False, True], ids=["module-level", "lazy"])
+def test_snapshot_helper_imports_are_isolated_across_successive_runs(
+    tmp_path: Path, relative: bool, lazy: bool
+) -> None:
+    """Catches missing sibling imports and cached helpers leaking between Runs."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    evaluation = project.module_dir(ModuleKind.EVALUATION)
+    evaluator = evaluation / "evaluator.py"
+    source = evaluator.read_text(encoding="utf-8")
+    statement = f"from {'.' if relative else ''}metrics import accuracy\n"
+    if lazy:
+        source = source.replace(
+            "def evaluate(dataset, predictions, config):\n",
+            "def evaluate(dataset, predictions, config):\n    " + statement,
+        )
+    else:
+        source = statement + source
+    source = source.replace(
+        "float(np.mean(truth[mask] == predicted[mask]))",
+        "accuracy(truth[mask], predicted[mask])",
+    )
+    evaluator.write_text(source, encoding="utf-8")
+    previous_path = list(sys.path)
+    previous_metrics = sys.modules.get("metrics")
+    measured = []
+    for value in (0.25, 0.75):
+        (evaluation / "metrics.py").write_text(
+            f"def accuracy(truth, predicted):\n    return {value}\n", encoding="utf-8"
+        )
+        approval = bind_experiment_approval(
+            prepare_experiment(project), "approval/import"
+        )
+        completed = execute_approved_run(project, approval)
+        measured.append(completed.metrics["accuracy"])
+        assert sys.path == previous_path
+        assert sys.modules.get("metrics") is previous_metrics
+        assert not any(
+            str(project.runs_dir) in str(getattr(module, "__file__", ""))
+            for module in tuple(sys.modules.values())
+        )
+        assert not list(project.runs_dir.rglob("__pycache__"))
+    assert measured == [0.25, 0.75]
+
+
+@pytest.mark.parametrize(
+    "stage", ["load_snapshot_dataset", "_verify_snapshot_runtime_environment"]
+)
+def test_keyboard_interrupt_preserves_logs_and_terminal_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Catches Ctrl+C orphaning a running record and discarding captured output."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    approval = bind_experiment_approval(
+        prepare_experiment(project), "approval/interrupt"
+    )
+    queued = prepare_run(project, approval.experiment)
+    interruption = KeyboardInterrupt("stop this Run")
+
+    def interrupted_load(*args: object):
+        print("loading interrupted by user")
+        raise interruption
+
+    monkeypatch.setattr(runner_module, stage, interrupted_load)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        execute_run(project, queued.id)
+    assert raised.value is interruption
+    assert RunRepository(project).load(queued.id).status == "interrupted"
+    run_dir = project.runs_dir / queued.id
+    log = (run_dir / "logs" / "worker.log").read_text(encoding="utf-8")
+    if stage == "load_snapshot_dataset":
+        assert "loading interrupted by user" in log
+    assert "KeyboardInterrupt: stop this Run" in log
+    events = [
+        json.loads(line)
+        for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-1]["status"] == "interrupted"
+
+
 def test_runner_rejects_runtime_inventory_change_after_run_preparation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

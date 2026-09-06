@@ -90,6 +90,8 @@ def prepare_run(
     run_seed = experiment.seed if repetition_seed is None else repetition_seed
     if isinstance(run_seed, bool) or not isinstance(run_seed, int):
         raise SnapshotValidationError("repetition seed must be an integer")
+    if run_seed != experiment.seed:
+        raise SnapshotValidationError("repetition must use the approved experiment seed")
     _verify_model_hash(experiment, "experiment")
 
     relative_inputs, source, evaluation = _capture_snapshot_inputs(

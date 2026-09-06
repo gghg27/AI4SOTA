@@ -11,6 +11,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml  # type: ignore[import-untyped]
+from pydantic import BaseModel
+
+from ai4sota.domain import DataModuleSpec, EvaluationSpec, MethodSpec, ProjectSpec
 
 from .atomic import atomic_write_bytes
 from .manifests import canonical_manifest_hash
@@ -43,11 +46,13 @@ def plan_schema_migration(path: Path, target: str) -> MigrationPlan:
     source_version = str(value.get("schema_version", "0.1"))
     key = (source_version, target, kind)
     try:
-        migration = MIGRATIONS[key]
+        migration, model = MIGRATIONS[key]
     except KeyError as error:
         raise ValueError(f"no registered schema migration for {key}") from error
     original_hash = _sha256(original)
     migrated = migration(value, original_hash)
+    migrated["content_hash"] = "sha256:" + "0" * 64
+    migrated = model.model_validate(migrated).model_dump(mode="json")
     migrated["content_hash"] = canonical_manifest_hash(migrated)
     migrated_bytes = yaml.safe_dump(
         migrated, allow_unicode=True, sort_keys=False
@@ -217,9 +222,9 @@ def _evaluation_migration(
     }
 
 
-MIGRATIONS: dict[tuple[str, str, str], Migration] = {
-    ("0.1", "ai4sota/v1", "project"): _project_migration,
-    ("0.1", "ai4sota/v1", "data"): _data_migration,
-    ("0.1", "ai4sota/v1", "method"): _method_migration,
-    ("0.1", "ai4sota/v1", "evaluation"): _evaluation_migration,
+MIGRATIONS: dict[tuple[str, str, str], tuple[Migration, type[BaseModel]]] = {
+    ("0.1", "ai4sota/v1", "project"): (_project_migration, ProjectSpec),
+    ("0.1", "ai4sota/v1", "data"): (_data_migration, DataModuleSpec),
+    ("0.1", "ai4sota/v1", "method"): (_method_migration, MethodSpec),
+    ("0.1", "ai4sota/v1", "evaluation"): (_evaluation_migration, EvaluationSpec),
 }
