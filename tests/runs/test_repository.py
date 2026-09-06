@@ -18,6 +18,7 @@ from ai4sota.runs import (
     RunPersistenceError,
     RunStateConflict,
     append_run_event,
+    fail_run,
     hash_tree,
     load_run_manifest,
     record_run_metrics,
@@ -382,6 +383,85 @@ def test_transition_recovers_durable_metrics_before_terminal_state(
     assert completed.status == "succeeded"
     assert completed.metrics == {"accuracy": 0.75}
     assert load_run_manifest(run_dir) == completed
+
+
+@pytest.mark.parametrize(
+    ("status", "pending_target"),
+    [("queued", "preparing"), ("preparing", "running")],
+)
+def test_fail_run_recovers_pending_state_before_terminal_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    pending_target: str,
+) -> None:
+    """Catches failure publication using a stale projected lifecycle state."""
+    run_dir = tmp_path / "run-001"
+    make_run(run_dir, status=status)
+    real_write = ManifestStore.write
+    failed_once = False
+
+    def fail_pending_projection(
+        store: ManifestStore, path: Path, value: object
+    ) -> None:
+        nonlocal failed_once
+        if (
+            not failed_once
+            and path == run_dir / "manifest.yaml"
+            and getattr(value, "status", None) == pending_target
+        ):
+            failed_once = True
+            raise OSError("injected pending projection failure")
+        real_write(store, path, value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ManifestStore, "write", fail_pending_projection)
+    with pytest.raises(RunPersistenceError, match="manifest projection"):
+        transition_run(run_dir, expected=status, target=pending_target)
+    monkeypatch.setattr(ManifestStore, "write", real_write)
+
+    failed = fail_run(run_dir)
+
+    assert failed.status == "failed"
+    assert load_run_manifest(run_dir) == failed
+    events = [
+        json.loads(line)
+        for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["status"] for event in events] == [pending_target, "failed"]
+
+
+def test_fail_run_recovers_pending_metrics_before_terminal_transition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches failure publication discarding a durable metric fact."""
+    run_dir = tmp_path / "run-001"
+    make_run(run_dir, status="running")
+    real_write = ManifestStore.write
+    failed_once = False
+
+    def fail_metric_projection(
+        store: ManifestStore, path: Path, value: object
+    ) -> None:
+        nonlocal failed_once
+        if (
+            not failed_once
+            and path == run_dir / "manifest.yaml"
+            and getattr(value, "metrics", None) == {"accuracy": 0.75}
+        ):
+            failed_once = True
+            raise OSError("injected metric projection failure")
+        real_write(store, path, value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ManifestStore, "write", fail_metric_projection)
+    with pytest.raises(RunPersistenceError, match="metrics projection"):
+        record_run_metrics(run_dir, {"accuracy": 0.75})
+    monkeypatch.setattr(ManifestStore, "write", real_write)
+
+    failed = fail_run(run_dir)
+
+    assert failed.status == "failed"
+    assert failed.metrics == {"accuracy": 0.75}
+    assert load_run_manifest(run_dir) == failed
 
 
 @pytest.mark.parametrize(

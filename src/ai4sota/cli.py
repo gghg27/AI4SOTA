@@ -189,11 +189,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.command == "research-commit":
             project = _project_layout(args.project)
-            repository = RunRepository(project)
-            if len(args.run_ids) > 1:
-                compare_runs(
-                    [repository.load(run_id) for run_id in args.run_ids]
-                )
             commit = create_research_commit(
                 project, _read_mapping(args.draft), args.run_ids
             )

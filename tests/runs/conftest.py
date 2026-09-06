@@ -62,14 +62,14 @@ def runnable_project(tmp_path: Path) -> tuple[ProjectLayout, ExperimentSpec, Pat
             "id": "dataset/seed",
             "version": "1.0.0",
             "name": "SEED",
-            "locations": [str(external_data)],
+            "locations": ["../external/seed-records.bin"],
             "sampling_rate_hz": 200.0,
             "metadata_fields": ["subject_id"],
             "fingerprint_hash": fingerprint_hash,
             "source_format": "binary",
         },
     )
-    preprocessing = write_hashed_manifest(
+    write_hashed_manifest(
         layout.module_dir(ModuleKind.DATA) / "preprocessing.yaml",
         PreprocessingSpec,
         {
@@ -86,8 +86,8 @@ def runnable_project(tmp_path: Path) -> tuple[ProjectLayout, ExperimentSpec, Pat
             "id": "data/seed",
             "version": "1.0.0",
             "origin": {"type": "project"},
-            "source": source.id,
-            "preprocessing": preprocessing.id,
+            "source": "dataset.yaml",
+            "preprocessing": "preprocessing.yaml",
             "entrypoint": "adapter:load_dataset",
             "canonical_outputs": ["features"],
             "task_contract": task.id,
@@ -183,7 +183,7 @@ def runnable_project(tmp_path: Path) -> tuple[ProjectLayout, ExperimentSpec, Pat
             "id": "dataset/unselected",
             "version": "1.0.0",
             "name": "Other data",
-            "locations": [str(external_data)],
+            "locations": ["../external/seed-records.bin"],
             "sampling_rate_hz": 200.0,
             "metadata_fields": ["subject_id"],
             "fingerprint_hash": "sha256:" + "f" * 64,

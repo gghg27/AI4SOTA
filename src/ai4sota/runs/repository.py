@@ -74,6 +74,9 @@ class RunRepository:
     ) -> RunManifest:
         return record_run_metrics(self.run_dir(run_id), metrics)
 
+    def fail_run(self, run_id: str) -> RunManifest:
+        return fail_run(self.run_dir(run_id))
+
 
 def load_run_manifest(run_dir: Path) -> RunManifest:
     """Read a strict Run manifest and verify its canonical content address."""
@@ -202,44 +205,78 @@ def transition_run(run_dir: Path, expected: str, target: str) -> RunManifest:
             raise RunStateConflict(
                 f"Run state conflict: expected {expected!r}, found {current.status!r}"
             )
-        allowed = ALLOWED_TRANSITIONS.get(current.status, frozenset())
-        if target not in allowed:
-            raise InvalidRunTransition(
-                f"cannot transition Run from {current.status!r} to {target!r}"
-            )
-        if _requires_integrity_check(current.status, target):
-            verify_run_integrity(directory)
+        return _transition_current_locked(directory, current, target)
 
-        draft = current.model_copy(update={"status": target})
-        updated = draft.model_copy(
-            update={"content_hash": canonical_manifest_hash(draft)}
-        )
-        event = RunEvent(
-            id=f"event-{uuid4().hex}",
-            run_id=current.id,
-            event_type="run_state_transition",
-            occurred_at=datetime.now(UTC),
-            previous_status=current.status,
-            status=target,
-            details={
-                "source_manifest_hash": current.content_hash,
-                "target_manifest_hash": updated.content_hash,
-                "target_manifest": updated.model_dump(mode="json"),
-            },
-        )
-        try:
-            _append_run_event_locked(
-                directory, event, current.id, allow_state_transition=True
+
+def fail_run(run_dir: Path) -> RunManifest:
+    """Recover durable facts and atomically publish an active Run as failed."""
+    directory = Path(run_dir)
+    if not directory.is_dir():
+        raise FileNotFoundError(f"run directory does not exist: {directory}")
+    with _exclusive_run_lock(directory):
+        current = _recover_pending_facts(directory, load_run_manifest(directory))
+        if current.status == "failed":
+            return current
+        if current.status not in {"preparing", "running"}:
+            raise RunStateConflict(
+                "Run state conflict: expected 'preparing' or 'running', "
+                f"found {current.status!r}"
             )
-        except Exception as error:
-            raise RunPersistenceError("could not persist transition event") from error
-        try:
-            ManifestStore().write(directory / "manifest.yaml", updated)
-        except Exception as error:
-            raise RunPersistenceError(
-                "could not persist manifest projection"
-            ) from error
-        return updated
+        return _transition_current_locked(directory, current, "failed")
+
+
+def _recover_pending_facts(run_dir: Path, current: RunManifest) -> RunManifest:
+    while True:
+        starting_hash = current.content_hash
+        recovered_metrics = _recover_pending_metrics(run_dir, current)
+        if recovered_metrics is not None:
+            current = recovered_metrics
+        recovered_transition = _recover_pending_transition(run_dir, current)
+        if recovered_transition is not None:
+            _, current = recovered_transition
+        if current.content_hash == starting_hash:
+            return current
+
+
+def _transition_current_locked(
+    directory: Path, current: RunManifest, target: str
+) -> RunManifest:
+    allowed = ALLOWED_TRANSITIONS.get(current.status, frozenset())
+    if target not in allowed:
+        raise InvalidRunTransition(
+            f"cannot transition Run from {current.status!r} to {target!r}"
+        )
+    if _requires_integrity_check(current.status, target):
+        verify_run_integrity(directory)
+
+    draft = current.model_copy(update={"status": target})
+    updated = draft.model_copy(
+        update={"content_hash": canonical_manifest_hash(draft)}
+    )
+    event = RunEvent(
+        id=f"event-{uuid4().hex}",
+        run_id=current.id,
+        event_type="run_state_transition",
+        occurred_at=datetime.now(UTC),
+        previous_status=current.status,
+        status=target,
+        details={
+            "source_manifest_hash": current.content_hash,
+            "target_manifest_hash": updated.content_hash,
+            "target_manifest": updated.model_dump(mode="json"),
+        },
+    )
+    try:
+        _append_run_event_locked(
+            directory, event, current.id, allow_state_transition=True
+        )
+    except Exception as error:
+        raise RunPersistenceError("could not persist transition event") from error
+    try:
+        ManifestStore().write(directory / "manifest.yaml", updated)
+    except Exception as error:
+        raise RunPersistenceError("could not persist manifest projection") from error
+    return updated
 
 
 def _recover_pending_transition(

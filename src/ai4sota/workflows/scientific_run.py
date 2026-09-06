@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TypeVar
 from uuid import uuid4
 
+import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError, model_validator
 
 from ai4sota.compatibility import CompatibilityReport, compile_compatibility
@@ -30,14 +31,18 @@ from ai4sota.domain import (
 )
 from ai4sota.domain.common import ContentHash, NonEmptyStr, StrictModel
 from ai4sota.evaluation import materialize_split
-from ai4sota.files import sha256_file
+from ai4sota.files import (
+    PathValidationError,
+    StableReadError,
+    resolve_bundle_file,
+    stable_read_file,
+)
 from ai4sota.library import hash_tree as module_tree_hash
 from ai4sota.projects import ProjectLayout
 from ai4sota.runner import execute_run, load_snapshot_dataset
 from ai4sota.runs import prepare_run, snapshot_input_hashes
 from ai4sota.storage import (
     ManifestStore,
-    atomic_write_bytes,
     canonical_manifest_hash,
 )
 
@@ -122,10 +127,7 @@ def prepare_experiment(project: ProjectLayout) -> PreparedExperiment:
         evaluation=specs.evaluation,
         task=specs.task,
     )
-    if compatibility.state in {
-        CompatibilityState.REQUIRES_DECISION,
-        CompatibilityState.INCOMPATIBLE,
-    }:
+    if compatibility.state is not CompatibilityState.COMPATIBLE:
         raise ExperimentBlocked(compatibility)
 
     _ensure_fingerprint_record(project, specs.source)
@@ -137,10 +139,6 @@ def prepare_experiment(project: ProjectLayout) -> PreparedExperiment:
         f"{split.id.replace('/', '-')}-{split.content_hash[7:19]}.yaml"
     )
     ManifestStore().write(split_path, split)
-    adapter_hashes = _persist_adapter_specs(
-        project, compatibility
-    )
-
     selection = ExperimentSpec(
         id=f"experiment-{uuid4().hex}",
         content_hash=ZERO_HASH,
@@ -153,7 +151,7 @@ def prepare_experiment(project: ProjectLayout) -> PreparedExperiment:
         split_manifest_hash=split.content_hash,
         seed=seed,
         input_hashes={"pending": ZERO_HASH},
-        generated_adapter_hashes=adapter_hashes,
+        generated_adapter_hashes=(),
         runtime_config=runtime_config,
         environment={"python": platform.python_version()},
     )
@@ -234,10 +232,10 @@ def _load_active_specs(project: ProjectLayout) -> _ActiveSpecs:
         project.module_dir(ModuleKind.EVALUATION) / "module.yaml",
         EvaluationSpec,
     )
-    source = _load_manifest_by_id(
+    source = _load_manifest_reference(
         data_root, DatasetSourceSpec, data.source, "dataset source"
     )
-    preprocessing = _load_manifest_by_id(
+    preprocessing = _load_manifest_reference(
         data_root,
         PreprocessingSpec,
         data.preprocessing,
@@ -263,23 +261,27 @@ def _load_active_specs(project: ProjectLayout) -> _ActiveSpecs:
     )
 
 
-def _load_manifest_by_id(
+def _load_manifest_reference(
     root: Path,
     model: type[ManifestT],
-    expected_id: str,
+    reference: str,
     label: str,
 ) -> ManifestT:
-    matches: list[ManifestT] = []
-    for path in sorted(root.glob("*.yaml")):
-        try:
-            value = ManifestStore().read(path, model)
-        except ValidationError:
-            continue
-        if value.id == expected_id:
-            matches.append(value)
-    if len(matches) != 1:
-        raise ValueError(f"{label} id matched {len(matches)} manifests")
-    return matches[0]
+    try:
+        path = resolve_bundle_file(root, reference)
+        document = yaml.safe_load(stable_read_file(path).data.decode("utf-8"))
+        value = model.model_validate(document)
+    except (
+        OSError,
+        PathValidationError,
+        StableReadError,
+        UnicodeError,
+        ValidationError,
+        yaml.YAMLError,
+    ) as error:
+        raise ValueError(f"invalid referenced {label}: {reference!r}") from error
+    _verify_canonical(value, label)
+    return value
 
 
 def _verify_canonical(value: object, label: str) -> None:
@@ -349,43 +351,11 @@ def _read_yaml_mapping(path: Path, *, required: bool) -> dict[str, object]:
         if required:
             raise FileNotFoundError(path)
         return {}
-    import yaml  # type: ignore[import-untyped]
-
     value = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
         raise ValueError(f"expected a string-keyed mapping in {path}")
     json.dumps(value, allow_nan=False)
     return value
-
-
-def _persist_adapter_specs(
-    project: ProjectLayout, compatibility: CompatibilityReport
-) -> tuple[str, ...]:
-    adapters = [
-        adapter.model_dump(mode="json")
-        for finding in compatibility.findings
-        for adapter in finding.adapters
-    ]
-    if not adapters:
-        return ()
-    data = (
-        json.dumps(
-            {
-                "compatibility_contract_hash": compatibility.contract_hash,
-                "adapters": adapters,
-            },
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        + "\n"
-    ).encode("utf-8")
-    path = project.adapters_dir / (
-        f"compatibility-{compatibility.contract_hash[7:23]}.json"
-    )
-    atomic_write_bytes(path, data)
-    return (sha256_file(path),)
 
 
 __all__ = [

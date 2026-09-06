@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ValidationError
 
 from .contracts import EvaluationResult, PredictionBundle
@@ -25,7 +26,13 @@ from .domain import (
     RunManifest,
     SplitManifest,
 )
-from .files import sha256_file
+from .files import (
+    PathValidationError,
+    StableReadError,
+    resolve_bundle_file,
+    resolve_file_location,
+    stable_read_file,
+)
 from .io_utils import read_json, read_yaml, utc_now, write_json
 from .loading import load_project_module, require_callable
 from .project import resolve_project
@@ -36,7 +43,7 @@ from .runs import (
     prepare_run,
     verify_run_integrity,
 )
-from .storage import ManifestStore, atomic_write_bytes
+from .storage import ManifestStore, atomic_write_bytes, canonical_manifest_hash
 from .validation import validate_project
 
 __all__ = [
@@ -181,7 +188,7 @@ def execute_run(project: ProjectLayout, run_id: str) -> RunManifest:
         running = repository.transition_run(run_id, "preparing", "running")
         with contextlib.redirect_stdout(logs), contextlib.redirect_stderr(logs):
             snapshot = run_dir / "snapshot"
-            _verify_snapshot_dataset_fingerprint(snapshot, running)
+            _verify_snapshot_dataset_fingerprint(snapshot, project.root, running)
             with _sealed_seed(running.seed):
                 dataset = load_snapshot_dataset(snapshot)
                 dataset = _apply_split(snapshot, running, dataset)
@@ -262,9 +269,7 @@ def execute_run(project: ProjectLayout, run_id: str) -> RunManifest:
         except Exception as bookkeeping_error:  # noqa: BLE001
             bookkeeping_errors.append(f"worker log: {bookkeeping_error}")
         try:
-            current = repository.load(run_id)
-            if current.status in {"preparing", "running"}:
-                repository.transition_run(run_id, current.status, "failed")
+            repository.fail_run(run_id)
         except Exception as bookkeeping_error:  # noqa: BLE001
             bookkeeping_errors.append(f"failure state: {bookkeeping_error}")
         message = f"run failed; details saved in {run_dir}"
@@ -349,16 +354,17 @@ def _apply_split(snapshot: Path, run: RunManifest, dataset: Any) -> Any:
 
 
 def _verify_snapshot_dataset_fingerprint(
-    snapshot: Path, run: RunManifest
+    snapshot: Path, project_root: Path, run: RunManifest
 ) -> None:
     data_root = snapshot / "modules" / "data" / "current"
     data = ManifestStore().read(data_root / "module.yaml", DataModuleSpec)
-    source = _load_manifest_by_id(
+    source = _load_manifest_reference(
         data_root, DatasetSourceSpec, data.source, "dataset source"
     )
     if len(source.locations) != 1:
         raise ValueError("Run requires exactly one external dataset location")
-    actual = sha256_file(Path(source.locations[0]))
+    location = resolve_file_location(project_root, source.locations[0])
+    actual = stable_read_file(location).sha256
     if actual != run.data_fingerprint_hash:
         raise ValueError(
             f"external dataset fingerprint changed: expected "
@@ -366,23 +372,28 @@ def _verify_snapshot_dataset_fingerprint(
         )
 
 
-def _load_manifest_by_id(
+def _load_manifest_reference(
     root: Path,
     model: type[BaseModel],
-    expected_id: str,
+    reference: str,
     label: str,
 ) -> Any:
-    matches: list[BaseModel] = []
-    for path in sorted(root.glob("*.yaml")):
-        try:
-            value = ManifestStore().read(path, model)
-        except ValidationError:
-            continue
-        if getattr(value, "id", None) == expected_id:
-            matches.append(value)
-    if len(matches) != 1:
-        raise ValueError(f"{label} id matched {len(matches)} manifests")
-    return matches[0]
+    try:
+        path = resolve_bundle_file(root, reference)
+        document = yaml.safe_load(stable_read_file(path).data.decode("utf-8"))
+        value = model.model_validate(document)
+    except (
+        OSError,
+        PathValidationError,
+        StableReadError,
+        UnicodeError,
+        ValidationError,
+        yaml.YAMLError,
+    ) as error:
+        raise ValueError(f"invalid referenced {label}: {reference!r}") from error
+    if getattr(value, "content_hash", None) != canonical_manifest_hash(value):
+        raise ValueError(f"referenced {label} content hash is not canonical")
+    return value
 
 
 def _load_selected_manifest(

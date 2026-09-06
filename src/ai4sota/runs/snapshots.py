@@ -25,7 +25,14 @@ from ai4sota.domain import (
     SplitManifest,
     TaskContract,
 )
-from ai4sota.files import StableFile, StableReadError, stable_read_file
+from ai4sota.files import (
+    PathValidationError,
+    StableFile,
+    StableReadError,
+    resolve_bundle_file,
+    resolve_file_location,
+    stable_read_file,
+)
 from ai4sota.projects import ProjectLayout
 from ai4sota.storage import (
     ManifestStore,
@@ -45,6 +52,9 @@ _ROOT_SNAPSHOT_FILES = (
     "pyproject.toml",
     "uv.lock",
     "requirements.txt",
+)
+_RUNTIME_DEPENDENCY_FILES = frozenset(
+    {"pyproject.toml", "uv.lock", "requirements.txt"}
 )
 _MAX_CONFIG_FILE_BYTES = 1024 * 1024
 
@@ -109,7 +119,13 @@ def prepare_run(
                     {"path": path, "sha256": value.sha256}
                     for path, value in sorted(relative_inputs.items())
                     if path.startswith(evaluation_prefix)
-                ]
+                ],
+                "runtime_dependency_files": [
+                    {"path": path, "sha256": value.sha256}
+                    for path, value in sorted(relative_inputs.items())
+                    if path in _RUNTIME_DEPENDENCY_FILES
+                ],
+                "environment": experiment.environment,
             }
         )
         draft = RunManifest(
@@ -146,7 +162,9 @@ def prepare_run(
                 },
             ),
         )
-        _verify_external_fingerprint(source, experiment.data_fingerprint_hash)
+        _verify_external_fingerprint(
+            project.root, source, experiment.data_fingerprint_hash
+        )
         if hash_tree(snapshot) != snapshot_hash:
             raise SnapshotValidationError(
                 "staged snapshot changed before durable publication"
@@ -215,17 +233,19 @@ def _capture_snapshot_inputs(
         "evaluation module",
     )
 
-    _, source = _find_verified_manifest_by_id(
-        module_files[ModuleKind.DATA],
-        DatasetSourceSpec,
-        data.source,
-        "dataset source",
+    source = _referenced_manifest(
+        data_root=project.module_dir(ModuleKind.DATA),
+        files=module_files[ModuleKind.DATA],
+        model=DatasetSourceSpec,
+        reference=data.source,
+        label="dataset source",
     )
-    _find_verified_manifest_by_id(
-        module_files[ModuleKind.DATA],
-        PreprocessingSpec,
-        data.preprocessing,
-        "preprocessing manifest",
+    _referenced_manifest(
+        data_root=project.module_dir(ModuleKind.DATA),
+        files=module_files[ModuleKind.DATA],
+        model=PreprocessingSpec,
+        reference=data.preprocessing,
+        label="preprocessing manifest",
     )
 
     split_candidates = _read_tree(project.splits_dir, "split manifests")
@@ -380,12 +400,14 @@ def _verify_semantic_closure(
         )
 
 
-def _verify_external_fingerprint(source: DatasetSourceSpec, expected_hash: str) -> None:
+def _verify_external_fingerprint(
+    base: Path, source: DatasetSourceSpec, expected_hash: str
+) -> None:
     if len(source.locations) != 1:
         raise SnapshotValidationError(
             "strong fingerprint verification currently requires one dataset location"
         )
-    location = Path(source.locations[0])
+    location = resolve_file_location(base, source.locations[0])
     actual = _read_file(location, "external dataset fingerprint").sha256
     if actual != expected_hash:
         raise SnapshotValidationError(
@@ -430,25 +452,26 @@ def _resolve_bound_adapter_files(
     return tuple(selected)
 
 
-def _find_verified_manifest_by_id(
+def _referenced_manifest(
+    *,
+    data_root: Path,
     files: Mapping[Path, StableFile],
     model: type[ModelT],
-    expected_id: str,
+    reference: str,
     label: str,
-) -> tuple[Path, ModelT]:
-    matches: list[tuple[Path, ModelT]] = []
-    for path, value in _manifest_files(files).items():
-        document = _load_mapping(path, value.data)
-        if document is None or document.get("id") != expected_id:
-            continue
-        parsed = _validate_model(path, document, model, label)
-        _verify_model_hash(parsed, label)
-        matches.append((path, parsed))
-    if len(matches) != 1:
+) -> ModelT:
+    try:
+        path = resolve_bundle_file(data_root, reference)
+    except PathValidationError as error:
         raise SnapshotValidationError(
-            f"referenced {label} id matched {len(matches)} manifests"
+            f"invalid referenced {label} path: {reference!r}"
+        ) from error
+    value = files.get(path)
+    if value is None:
+        raise SnapshotValidationError(
+            f"referenced {label} is not a regular file in the Data bundle: {reference!r}"
         )
-    return matches[0]
+    return _verified_manifest(path, value, model, label)
 
 
 def _find_verified_manifest(

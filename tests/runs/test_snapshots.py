@@ -79,6 +79,29 @@ def test_workspace_edit_after_prepare_does_not_change_snapshot(
     assert manifest.snapshot_hash == hash_tree(snapshot_root)
 
 
+def test_prepare_run_resolves_data_references_as_bundle_paths(
+    runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
+) -> None:
+    """Catches snapshot capture searching referenced manifests by internal ID."""
+    project, experiment, _ = runnable_project
+    data_root = project.module_dir(ModuleKind.DATA)
+    data = ManifestStore().read(data_root / "module.yaml", DataModuleSpec)
+    source = ManifestStore().read(data_root / data.source, DatasetSourceSpec)
+
+    manifest = prepare_run(project, experiment)
+
+    assert source.id == "dataset/seed"
+    assert (
+        project.runs_dir
+        / manifest.id
+        / "snapshot"
+        / "modules"
+        / "data"
+        / "current"
+        / data.source
+    ).is_file()
+
+
 def test_prepare_run_copies_only_the_selected_scientific_inputs(
     runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
 ) -> None:
@@ -244,6 +267,22 @@ def test_prepare_run_recomputes_the_external_data_fingerprint(
         prepare_run(project, experiment)
 
     assert list(project.runs_dir.iterdir()) == []
+
+
+def test_prepare_run_resolves_relative_dataset_location_from_project_root(
+    runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches snapshot preparation resolving external data from process CWD."""
+    project, experiment, external_data = runnable_project
+    unrelated_cwd = tmp_path / "unrelated" / "nested-cwd"
+    unrelated_cwd.mkdir(parents=True)
+    monkeypatch.chdir(unrelated_cwd)
+
+    manifest = prepare_run(project, experiment)
+
+    assert manifest.data_fingerprint_hash == sha256_file(external_data)
 
 
 def test_prepare_run_binds_exact_selected_fingerprint_record_bytes(

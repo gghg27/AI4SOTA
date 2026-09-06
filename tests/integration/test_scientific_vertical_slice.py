@@ -116,20 +116,20 @@ def create_v1_demo_project(root: Path) -> ProjectLayout:
         data_draft / "dataset.yaml",
         DatasetSourceSpec,
         {
-            "id": "dataset.yaml",
+            "id": "dataset/demo-source",
             "name": "Local demo data",
-            "locations": [str(dataset_path)],
+            "locations": ["../demo-dataset.npz"],
             "sampling_rate_hz": 1.0,
             "metadata_fields": ["sample_id", "subject_id"],
             "fingerprint_hash": fingerprint,
             "source_format": "npz",
         },
     )
-    preprocessing = _write_hashed_manifest(
+    _write_hashed_manifest(
         data_draft / "preprocessing.yaml",
         PreprocessingSpec,
         {
-            "id": "preprocessing.yaml",
+            "id": "preprocessing/demo-v1",
             "transforms": [],
             "graph_hash": "sha256:" + "1" * 64,
         },
@@ -140,8 +140,8 @@ def create_v1_demo_project(root: Path) -> ProjectLayout:
         {
             "id": "data/demo",
             "origin": {"type": "project"},
-            "source": source.id,
-            "preprocessing": preprocessing.id,
+            "source": "dataset.yaml",
+            "preprocessing": "preprocessing.yaml",
             "entrypoint": "adapter:load_dataset",
             "canonical_outputs": [
                 "features",
@@ -293,6 +293,46 @@ def _edit_learning_rate(project: ProjectLayout, value: float) -> None:
     path.write_text(yaml.safe_dump({"learning_rate": value}), encoding="utf-8")
 
 
+def test_data_manifest_references_resolve_bundle_paths_not_internal_ids(
+    tmp_path: Path,
+) -> None:
+    """Catches Data manifest file references being interpreted as schema IDs."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    data_root = project.module_dir(ModuleKind.DATA)
+    data = ManifestStore().read(data_root / "module.yaml", DataModuleSpec)
+    source = ManifestStore().read(data_root / data.source, DatasetSourceSpec)
+    preprocessing = ManifestStore().read(
+        data_root / data.preprocessing, PreprocessingSpec
+    )
+
+    prepared = prepare_experiment(project)
+
+    assert data.source == "dataset.yaml"
+    assert source.id == "dataset/demo-source"
+    assert data.preprocessing == "preprocessing.yaml"
+    assert preprocessing.id == "preprocessing/demo-v1"
+    assert prepared.spec.data_fingerprint_hash == source.fingerprint_hash
+
+
+def test_relative_dataset_location_uses_project_root_for_prepare_and_execute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches external data identity depending on the worker process CWD."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    unrelated_cwd = tmp_path / "unrelated" / "nested-cwd"
+    unrelated_cwd.mkdir(parents=True)
+    monkeypatch.chdir(unrelated_cwd)
+
+    prepared = prepare_experiment(project)
+    completed = execute_approved_run(
+        project,
+        bind_experiment_approval(prepared, "approval/relative-dataset"),
+    )
+
+    assert completed.status == "succeeded"
+    assert completed.data_fingerprint_hash == prepared.spec.data_fingerprint_hash
+
+
 def test_two_runs_compare_and_promote_to_research_commit(tmp_path: Path) -> None:
     """Catches a headless flow bypassing snapshots, comparison, or exact promotion."""
     project = create_v1_demo_project(tmp_path / "demo")
@@ -382,6 +422,33 @@ def test_changed_evaluation_code_blocks_metric_comparison(tmp_path: Path) -> Non
     assert comparison.metric_deltas is None
 
 
+def test_changed_dependency_lock_blocks_metric_comparison(tmp_path: Path) -> None:
+    """Catches runtime dependency drift retaining a comparable metric identity."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    lockfile = project.root / "uv.lock"
+    lockfile.write_text("version = 1\n", encoding="utf-8")
+    first = execute_approved_run(
+        project,
+        bind_experiment_approval(
+            prepare_experiment(project), "approval/dependency-lock-001"
+        ),
+    )
+    lockfile.write_text("version = 2\n", encoding="utf-8")
+    second = execute_approved_run(
+        project,
+        bind_experiment_approval(
+            prepare_experiment(project), "approval/dependency-lock-002"
+        ),
+    )
+
+    comparison = compare_runs([first, second])
+
+    assert first.metric_implementation_hash != second.metric_implementation_hash
+    assert comparison.state is ComparabilityState.NONE
+    assert comparison.blocking_fields == ("metric_implementation_hash",)
+    assert comparison.metric_deltas is None
+
+
 def test_approval_hash_mismatch_is_rejected_before_run_creation(
     tmp_path: Path,
 ) -> None:
@@ -433,6 +500,59 @@ def test_blocked_compatibility_prevents_split_and_experiment(
     with pytest.raises(ExperimentBlocked):
         prepare_experiment(project)
     assert tuple(project.splits_dir.iterdir()) == ()
+
+
+@pytest.mark.parametrize(
+    "input_requirements",
+    [
+        {
+            "features": {
+                "field": "features",
+                "adaptation": "axis_transpose",
+                "parameters": {
+                    "source_axes": ["sample", "feature"],
+                    "target_axes": ["feature", "sample"],
+                },
+            }
+        },
+        {
+            "prediction": {
+                "field": "features",
+                "adaptation": "field_rename",
+                "parameters": {
+                    "source_field": "features",
+                    "target_field": "prediction",
+                },
+            }
+        },
+    ],
+    ids=["data-axis-adapter", "prediction-field-adapter"],
+)
+def test_inert_mechanical_adapters_are_blocked_before_run_preparation(
+    tmp_path: Path,
+    input_requirements: dict[str, object],
+) -> None:
+    """Catches reviewable but unapplied adapters silently authorizing execution."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    path = project.module_dir(ModuleKind.METHOD) / "module.yaml"
+    current = ManifestStore().read(path, MethodSpec)
+    draft = current.model_copy(
+        update={"input_requirements": input_requirements, "content_hash": ZERO_HASH}
+    )
+    adaptable = draft.model_copy(
+        update={"content_hash": canonical_manifest_hash(draft)}
+    )
+    ManifestStore().write(path, adaptable)
+
+    report = compile_project(project)
+
+    assert report.state is CompatibilityState.ADAPTABLE
+    assert any(finding.adapters for finding in report.findings)
+    with pytest.raises(ExperimentBlocked) as captured:
+        prepare_experiment(project)
+    assert captured.value.report == report
+    assert tuple(project.splits_dir.iterdir()) == ()
+    assert tuple(project.adapters_dir.iterdir()) == ()
 
 
 def test_prepare_experiment_persists_the_canonical_subject_safe_split(
@@ -579,6 +699,48 @@ def test_runner_records_a_worker_start_failure_as_terminal(
     assert "injected worker start failure" in worker_log
 
 
+def test_runner_failure_recovers_a_pending_running_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches failure handling racing a durable worker-start transition fact."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    approval = bind_experiment_approval(
+        prepare_experiment(project), "approval/pending-worker-start"
+    )
+    queued = prepare_run(project, approval.experiment)
+    real_write = ManifestStore.write
+    failed_once = False
+
+    def fail_running_projection(
+        store: ManifestStore, path: Path, value: object
+    ) -> None:
+        nonlocal failed_once
+        if not failed_once and getattr(value, "status", None) == "running":
+            failed_once = True
+            raise OSError("injected running projection failure")
+        real_write(store, path, value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ManifestStore, "write", fail_running_projection)
+
+    with pytest.raises(RuntimeError, match="run failed"):
+        execute_run(project, queued.id)
+
+    stored = RunRepository(project).load(queued.id)
+    assert stored.status == "failed"
+    events = [
+        json.loads(line)
+        for line in (project.runs_dir / queued.id / "events.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [event["status"] for event in events if event.get("status")] == [
+        "queued",
+        "preparing",
+        "running",
+        "failed",
+    ]
+
+
 def test_runner_failure_bookkeeping_does_not_mask_the_execution_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -590,18 +752,18 @@ def test_runner_failure_bookkeeping_does_not_mask_the_execution_error(
     queued = prepare_run(project, approval.experiment)
     real_transition = RunRepository.transition_run
 
-    def fail_start_and_terminal_record(
+    def fail_start(
         repository: RunRepository, run_id: str, expected: str, target: str
     ) -> RunManifest:
         if (expected, target) == ("preparing", "running"):
             raise RuntimeError("original worker start failure")
-        if target == "failed":
-            raise OSError("injected failure-state persistence error")
         return real_transition(repository, run_id, expected, target)
 
-    monkeypatch.setattr(
-        RunRepository, "transition_run", fail_start_and_terminal_record
-    )
+    def fail_terminal_record(repository: RunRepository, run_id: str) -> RunManifest:
+        raise OSError("injected failure-state persistence error")
+
+    monkeypatch.setattr(RunRepository, "transition_run", fail_start)
+    monkeypatch.setattr(RunRepository, "fail_run", fail_terminal_record)
 
     with pytest.raises(RuntimeError, match="run failed") as captured:
         execute_run(project, queued.id)

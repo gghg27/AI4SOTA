@@ -32,6 +32,10 @@ git -C $ProjectRoot commit -m "chore: initialize research project"
 .venv\Scripts\python -m ai4sota compile $ProjectRoot --json
 ```
 
+当前 headless 执行器只允许 `compatible` 进入 `prepare-run`。`adaptable`
+报告仍会展示可审查的机械适配器规格，但在兼容性层拥有确定性执行器之前不会授权
+Run，避免生成但未应用的适配器静默改变实际实验边界。
+
 准备第一个 Run。`prepare-run` 会冻结划分与完整输入闭包，并把带审批 ID 的候选写入指定文件；它不会执行实验。研究者应先检查文件内容和输出中的 `approval_hash`：
 
 ```powershell
