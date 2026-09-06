@@ -577,28 +577,44 @@ def test_import_rejects_a_staged_directory_swap_and_restores_current(
     assert replacement is not None and replacement.is_dir()
 
 
-def test_publish_rejects_a_staged_directory_swap_after_creation_and_preserves_replacement(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("operation", ["publish", "import"])
+def test_copy_failure_after_a_staging_swap_preserves_both_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
 ) -> None:
     library = ModuleLibrary(tmp_path / "library")
     draft = valid_draft(tmp_path, "data/seed", "1.0.0")
-    replacement: Path | None = None
+    published = (
+        library.publish(draft, expected_hash=hash_tree(draft.path))
+        if operation == "import"
+        else None
+    )
+    project = ProjectLayout.create(tmp_path, "project")
+    original_moved: Path | None = None
+    substituted: Path | None = None
 
     def swap_staged_directory(staged: Path) -> None:
-        nonlocal replacement
-        replacement = staged.with_name(staged.name + ".replacement")
-        staged.rename(replacement)
+        nonlocal original_moved, substituted
+        original_moved = staged.with_name(staged.name + ".replacement")
+        staged.rename(original_moved)
+        (original_moved / "original-sentinel").write_text("original", encoding="utf-8")
         staged.mkdir()
+        substituted = staged
+        (substituted / "substituted-sentinel").write_text("substituted", encoding="utf-8")
 
     monkeypatch.setattr(
         library_service, "_after_staging_directory_created", swap_staged_directory, raising=False
     )
 
     with pytest.raises(LibraryValidationError, match="directory identity changed"):
-        library.publish(draft, expected_hash=hash_tree(draft.path))
+        if published is None:
+            library.publish(draft, expected_hash=hash_tree(draft.path))
+        else:
+            library.import_version(published.ref, project)
 
-    assert replacement is not None and replacement.is_dir()
-    assert not (library.root / "data" / "seed" / "1.0.0").exists()
+    assert original_moved is not None and original_moved.is_dir()
+    assert (original_moved / "original-sentinel").read_text(encoding="utf-8") == "original"
+    assert substituted is not None and substituted.is_dir()
+    assert (substituted / "substituted-sentinel").read_text(encoding="utf-8") == "substituted"
 
 
 @pytest.mark.parametrize("failure_stage", ["original", "staged"])

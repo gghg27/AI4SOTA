@@ -147,7 +147,8 @@ class ModuleLibrary:
                     raise VersionExists(draft.ref)
                 durable_replace(staged, destination)
             except Exception:
-                _remove_staging_tree(staged, staged_identity)
+                if staged_identity is not None:
+                    _remove_staging_tree(staged, staged_identity)
                 if destination.exists():
                     raise VersionExists(draft.ref) from None
                 raise
@@ -212,7 +213,8 @@ class ModuleLibrary:
             _capture_directory(backup)
             backup.rmdir()
         except Exception:
-            _remove_staging_tree(staged, staged_identity)
+            if staged_identity is not None:
+                _remove_staging_tree(staged, staged_identity)
             if _matches_directory_identity(backup, target_identity) and not _matches_directory_identity(
                 target, target_identity
             ):
@@ -565,13 +567,11 @@ def _safe_unlink(path: Path) -> None:
     path.unlink()
 
 
-def _remove_staging_tree(
-    path: Path, expected_identity: _DirectoryIdentity | None = None
-) -> None:
+def _remove_staging_tree(path: Path, expected_identity: _DirectoryIdentity) -> None:
     if not path.exists():
         return
     identity = _capture_directory(path)
-    if expected_identity is not None and identity != expected_identity:
+    if identity != expected_identity:
         return
     _iter_regular_files(path)
     shutil.rmtree(path)
@@ -634,7 +634,7 @@ def _cleanup_interrupted_staging(parent: Path, version: str) -> None:
     prefix = f".{version}."
     for candidate in parent.iterdir():
         if candidate.name.startswith(prefix) and candidate.name.endswith(".staging"):
-            _remove_staging_tree(candidate)
+            _remove_staging_tree(candidate, _capture_directory(candidate))
     _require_directory_identity(parent_identity)
 
 
