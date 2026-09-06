@@ -22,7 +22,7 @@ ai4sota = "ai4sota.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-ai4sota = ["templates/**/*"]
+ai4sota = ["templates/**/*", "templates/v1/.gitattributes"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
