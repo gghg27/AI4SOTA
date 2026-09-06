@@ -577,6 +577,30 @@ def test_import_rejects_a_staged_directory_swap_and_restores_current(
     assert replacement is not None and replacement.is_dir()
 
 
+def test_publish_rejects_a_staged_directory_swap_after_creation_and_preserves_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    replacement: Path | None = None
+
+    def swap_staged_directory(staged: Path) -> None:
+        nonlocal replacement
+        replacement = staged.with_name(staged.name + ".replacement")
+        staged.rename(replacement)
+        staged.mkdir()
+
+    monkeypatch.setattr(
+        library_service, "_after_staging_directory_created", swap_staged_directory, raising=False
+    )
+
+    with pytest.raises(LibraryValidationError, match="directory identity changed"):
+        library.publish(draft, expected_hash=hash_tree(draft.path))
+
+    assert replacement is not None and replacement.is_dir()
+    assert not (library.root / "data" / "seed" / "1.0.0").exists()
+
+
 @pytest.mark.parametrize("failure_stage", ["original", "staged"])
 def test_import_restores_original_after_a_rename_reports_failure_post_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
@@ -601,6 +625,33 @@ def test_import_restores_original_after_a_rename_reports_failure_post_effect(
         library.import_version(published.ref, project)
 
     assert target.is_dir() and list(target.iterdir()) == []
+
+
+def test_import_keeps_the_original_current_directory_after_rollback_reports_failure_post_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+    project = ProjectLayout.create(tmp_path, "project")
+    target = project.module_dir("data")
+    original_identity = (target.stat().st_dev, target.stat().st_ino)
+    real_replace = library_service.durable_replace
+
+    def replace_then_fail_after_effect(source: Path, destination: Path) -> None:
+        real_replace(source, destination)
+        if source == target:
+            raise OSError("original rename durability failure")
+        if source.name.endswith(".backup") and destination == target:
+            raise OSError("rollback durability failure")
+
+    monkeypatch.setattr(library_service, "durable_replace", replace_then_fail_after_effect)
+
+    with pytest.raises(OSError, match="original rename durability failure"):
+        library.import_version(published.ref, project)
+
+    assert (target.stat().st_dev, target.stat().st_ino) == original_identity
+    assert list(target.iterdir()) == []
 
 
 def test_import_preserves_the_original_backup_when_rollback_fails(

@@ -425,6 +425,10 @@ def _before_import_rename(staged: Path, target: Path) -> None:
     """Test seam immediately before a verified staged import is renamed."""
 
 
+def _after_staging_directory_created(staged: Path) -> None:
+    """Test seam after a new staging directory has an anchored identity."""
+
+
 def _iter_regular_files(root: Path) -> list[Path]:
     files: list[Path] = []
 
@@ -525,9 +529,12 @@ def _copy_tree(source: Path, destination: Path) -> _DirectoryIdentity:
     source_identity = _capture_directory(source)
     if destination.exists():
         raise FileExistsError(destination)
-    _safe_create_directory(destination)
+    destination_identity = _capture_directory(_safe_create_directory(destination))
     try:
+        _after_staging_directory_created(destination)
         for source_file in _iter_regular_files(source_identity.path):
+            _require_directory_identity(source_identity)
+            _require_directory_identity(destination_identity)
             relative = source_file.relative_to(source_identity.path)
             try:
                 data = stable_read_file(source_file).data
@@ -535,12 +542,15 @@ def _copy_tree(source: Path, destination: Path) -> _DirectoryIdentity:
                 raise LibraryValidationError(str(error)) from error
             destination_file = _safe_child(destination, *relative.parts)
             _safe_create_directory(destination_file.parent)
+            _require_directory_identity(destination_identity)
             atomic_write_bytes(destination_file, data)
             _require_directory_identity(source_identity)
+            _require_directory_identity(destination_identity)
         _require_directory_identity(source_identity)
-        return _capture_directory(destination)
+        _require_directory_identity(destination_identity)
+        return destination_identity
     except Exception:
-        _remove_staging_tree(destination)
+        _remove_staging_tree(destination, destination_identity)
         raise
 
 
