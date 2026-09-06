@@ -56,7 +56,7 @@ def make_run(run_dir: Path, status: str = "draft") -> RunManifest:
 def test_legacy_manifest_without_repetition_coordinates_keeps_its_hash(
     tmp_path: Path,
 ) -> None:
-    """Catches optional aggregation coordinates invalidating existing Run evidence."""
+    """Catches optional Run fields invalidating existing evidence."""
     run_dir = tmp_path / "run-legacy"
     run_dir.mkdir()
     document: dict[str, object] = {
@@ -85,6 +85,7 @@ def test_legacy_manifest_without_repetition_coordinates_keeps_its_hash(
     assert manifest.seed is None
     assert manifest.fold is None
     assert manifest.repeat is None
+    assert manifest.metric_environment_state is None
 
 
 def write_transition_event(

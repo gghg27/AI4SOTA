@@ -16,8 +16,10 @@ from ai4sota.domain import RunManifest
 from .atomic import atomic_write_bytes
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
-_REPETITION_FIELDS = frozenset({"seed", "fold", "repeat"})
-_RUN_MANIFEST_FIELDS = frozenset(RunManifest.model_fields) - _REPETITION_FIELDS
+_OPTIONAL_RUN_FIELDS = frozenset(
+    {"seed", "fold", "repeat", "metric_environment_state"}
+)
+_RUN_MANIFEST_FIELDS = frozenset(RunManifest.model_fields) - _OPTIONAL_RUN_FIELDS
 
 
 def canonical_manifest_hash(value: BaseModel | Mapping[str, Any]) -> str:
@@ -27,7 +29,7 @@ def canonical_manifest_hash(value: BaseModel | Mapping[str, Any]) -> str:
     else:
         document = dict(value)
     if isinstance(value, RunManifest) or _is_run_manifest_document(document):
-        for field in _REPETITION_FIELDS:
+        for field in _OPTIONAL_RUN_FIELDS:
             if document.get(field) is None:
                 document.pop(field, None)
     document.pop("content_hash", None)

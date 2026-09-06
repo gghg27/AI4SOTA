@@ -88,6 +88,7 @@ def _publish_and_import(
 
 def create_v1_demo_project(root: Path) -> ProjectLayout:
     project = ProjectLayout.create(root.parent, root.name)
+    (project.root / "uv.lock").write_text("version = 1\n", encoding="utf-8")
     dataset_path = root.parent / "demo-dataset.npz"
     np.savez(
         dataset_path,
@@ -446,6 +447,31 @@ def test_changed_dependency_lock_blocks_metric_comparison(tmp_path: Path) -> Non
     assert first.metric_implementation_hash != second.metric_implementation_hash
     assert comparison.state is ComparabilityState.NONE
     assert comparison.blocking_fields == ("metric_implementation_hash",)
+    assert comparison.metric_deltas is None
+
+
+def test_missing_dependency_lock_blocks_metric_comparison(tmp_path: Path) -> None:
+    """Catches an unknown evaluator environment being treated as reproducible."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    (project.root / "uv.lock").unlink()
+    first = execute_approved_run(
+        project,
+        bind_experiment_approval(
+            prepare_experiment(project), "approval/missing-dependency-lock-001"
+        ),
+    )
+    _edit_learning_rate(project, 0.02)
+    second = execute_approved_run(
+        project,
+        bind_experiment_approval(
+            prepare_experiment(project), "approval/missing-dependency-lock-002"
+        ),
+    )
+
+    comparison = compare_runs([first, second])
+
+    assert comparison.state is ComparabilityState.NONE
+    assert comparison.blocking_fields == ("metric_environment_state",)
     assert comparison.metric_deltas is None
 
 

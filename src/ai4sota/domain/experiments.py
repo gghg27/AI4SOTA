@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import PurePosixPath
+from typing import Literal
 
 from pydantic import Field, field_validator, model_validator
 
@@ -88,6 +89,7 @@ class RunManifest(SchemaHeader):
     split_manifest_hash: ContentHash
     evaluation_protocol_hash: ContentHash
     metric_implementation_hash: ContentHash
+    metric_environment_state: Literal["reproducible", "unresolved"] | None = None
     integrity_state: NonEmptyStr
     status: NonEmptyStr = "draft"
     metrics: dict[NonEmptyStr, float] = Field(default_factory=dict)

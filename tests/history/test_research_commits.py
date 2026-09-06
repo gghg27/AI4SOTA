@@ -90,6 +90,7 @@ def completed_run(
         split_manifest_hash=split_manifest_hash or "sha256:" + "4" * 64,
         evaluation_protocol_hash="sha256:" + "5" * 64,
         metric_implementation_hash="sha256:" + "6" * 64,
+        metric_environment_state="reproducible",
         integrity_state=integrity_state,
         status=status,
         metrics={"accuracy": accuracy},

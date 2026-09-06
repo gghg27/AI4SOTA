@@ -16,6 +16,7 @@ BLOCKING_FIELDS = (
     "split_manifest_hash",
     "evaluation_protocol_hash",
     "metric_implementation_hash",
+    "metric_environment_state",
     "integrity_state",
 )
 _CAVEAT_FIELDS = frozenset({"project_id", "seed", "fold", "repeat"})
@@ -61,6 +62,8 @@ def compare_runs(runs: Sequence[RunManifest]) -> ComparabilityReport:
         raise ValueError("at least two Runs are required for comparison")
     differences = field_differences(runs)
     blocking = tuple(name for name in BLOCKING_FIELDS if name in differences)
+    if any(run.metric_environment_state != "reproducible" for run in runs):
+        blocking = tuple(dict.fromkeys((*blocking, "metric_environment_state")))
     if any(run.status != "succeeded" for run in runs):
         blocking = tuple(dict.fromkeys((*blocking, "status")))
     if any(

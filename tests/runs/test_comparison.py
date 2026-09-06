@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 import pytest
 
 from ai4sota.domain import ComparabilityState, RunManifest
@@ -15,6 +17,7 @@ def make_run(
     seed: int | None = None,
     status: str = "succeeded",
     macro_f1: float = 0.8,
+    metric_environment_state: Literal["reproducible", "unresolved"] = "reproducible",
 ) -> RunManifest:
     return RunManifest(
         id=run_id,
@@ -27,6 +30,7 @@ def make_run(
         split_manifest_hash=split_manifest_hash,
         evaluation_protocol_hash=CONTENT_HASH,
         metric_implementation_hash=CONTENT_HASH,
+        metric_environment_state=metric_environment_state,
         integrity_state="verified",
         status=status,
         seed=seed,
@@ -74,6 +78,20 @@ def test_completed_runs_report_metric_deltas_relative_to_the_first_run() -> None
 
     assert report.state is ComparabilityState.DIRECT
     assert report.metric_deltas == {"macro_f1": pytest.approx((0.03,))}
+
+
+def test_unresolved_metric_environment_suppresses_delta_language() -> None:
+    """Catches equal unknown dependency states authorizing a direct comparison."""
+    report = compare_runs(
+        [
+            make_run("run-a", metric_environment_state="unresolved"),
+            make_run("run-b", metric_environment_state="unresolved"),
+        ]
+    )
+
+    assert report.state is ComparabilityState.NONE
+    assert report.blocking_fields == ("metric_environment_state",)
+    assert report.metric_deltas is None
 
 
 def test_incomplete_run_suppresses_delta_language() -> None:

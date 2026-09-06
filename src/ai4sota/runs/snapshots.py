@@ -6,7 +6,7 @@ import json
 import shutil
 from collections.abc import Iterable, Mapping
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from uuid import uuid4
 
 import yaml  # type: ignore[import-untyped]
@@ -128,6 +128,15 @@ def prepare_run(
                 "environment": experiment.environment,
             }
         )
+        # v1 recognizes uv.lock as its deterministic resolved dependency inventory.
+        metric_environment_state: Literal["reproducible", "unresolved"] = (
+            "reproducible"
+            if (
+                "uv.lock" in relative_inputs
+                and bool(relative_inputs["uv.lock"].data.strip())
+            )
+            else "unresolved"
+        )
         draft = RunManifest(
             id=run_id,
             content_hash="sha256:" + "0" * 64,
@@ -139,6 +148,7 @@ def prepare_run(
             split_manifest_hash=experiment.split_manifest_hash,
             evaluation_protocol_hash=protocol_hash,
             metric_implementation_hash=metric_hash,
+            metric_environment_state=metric_environment_state,
             integrity_state="verified",
             status="queued",
             seed=run_seed,

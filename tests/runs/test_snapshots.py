@@ -79,6 +79,17 @@ def test_workspace_edit_after_prepare_does_not_change_snapshot(
     assert manifest.snapshot_hash == hash_tree(snapshot_root)
 
 
+def test_prepare_run_marks_missing_runtime_lock_unresolved(
+    runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
+) -> None:
+    """Catches a missing dependency lock being assigned reproducible identity."""
+    project, experiment, _ = runnable_project
+
+    manifest = prepare_run(project, experiment)
+
+    assert manifest.metric_environment_state == "unresolved"
+
+
 def test_prepare_run_resolves_data_references_as_bundle_paths(
     runnable_project: tuple[ProjectLayout, ExperimentSpec, Path],
 ) -> None:
