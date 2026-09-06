@@ -304,7 +304,7 @@ def test_concurrent_publication_never_overwrites_an_existing_version(tmp_path: P
     assert sum(isinstance(result, VersionExists) for result in results) == 1
     assert library.read("data/seed@1.0.0").content_hash == expected_hash
     assert list((library.root / "data" / "seed").glob(".*.staging")) == []
-    assert list((library.root / ".locks" / "data" / "seed").glob("*.lock")) == []
+    assert (library.root / ".locks" / "data" / "seed" / "1.0.0.lock").is_file()
 
 
 def test_failed_publication_cleans_up_its_staging_tree(tmp_path: Path) -> None:
@@ -343,10 +343,13 @@ def test_import_uses_verified_staged_bytes_when_source_changes_during_copy(
     project = ProjectLayout.create(tmp_path, "seed-project")
     real_copy = library_service._copy_tree
 
-    def copy_then_tamper(source: Path, destination: Path) -> None:
-        real_copy(source, destination)
+    def copy_then_tamper(
+        source: Path, destination: Path
+    ) -> library_service._DirectoryIdentity:
+        copied = real_copy(source, destination)
         if source == published.path:
             (source / "adapter.py").write_text("RACED = True\n", encoding="utf-8")
+        return copied
 
     monkeypatch.setattr(library_service, "_copy_tree", copy_then_tamper)
 
@@ -476,4 +479,195 @@ def test_retry_recovers_a_subprocess_interrupted_publication(tmp_path: Path) -> 
 
     assert published.ref == "data/seed@1.0.0"
     assert not staging.exists()
-    assert not lock.exists()
+    assert lock.is_file()
+
+
+def test_read_returns_the_verified_digest_when_payload_changes_after_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+
+    def mutate_after_anchor(path: Path) -> None:
+        if path == published.path:
+            (path / "adapter.py").write_text("AFTER_ANCHOR = True\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        library_service, "_after_publication_verified", mutate_after_anchor, raising=False
+    )
+
+    observed = library.read(published.ref)
+
+    assert (published.path / "adapter.py").read_text(encoding="utf-8") == (
+        "AFTER_ANCHOR = True\n"
+    )
+    assert observed.content_hash == published.content_hash
+
+
+def test_create_draft_and_import_reject_payload_changed_after_read_anchor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+
+    def mutate_after_anchor(path: Path) -> None:
+        if path == published.path:
+            (path / "adapter.py").write_text("AFTER_ANCHOR = True\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        library_service, "_after_publication_verified", mutate_after_anchor, raising=False
+    )
+
+    with pytest.raises(LibraryValidationError, match="publication integrity"):
+        library.create_draft(published.ref)
+    with pytest.raises(LibraryValidationError, match="publication integrity"):
+        library.import_version(published.ref, ProjectLayout.create(tmp_path, "project"))
+
+
+def test_publish_rejects_a_staged_directory_swap_before_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    replacement: Path | None = None
+
+    def swap_staged_directory(staged: Path, destination: Path) -> None:
+        nonlocal replacement
+        replacement = staged.with_name(staged.name + ".replacement")
+        staged.rename(replacement)
+        staged.mkdir()
+
+    monkeypatch.setattr(
+        library_service, "_before_publish_rename", swap_staged_directory, raising=False
+    )
+
+    with pytest.raises(LibraryValidationError, match="directory identity changed"):
+        library.publish(draft, expected_hash=hash_tree(draft.path))
+
+    assert replacement is not None and replacement.is_dir()
+    assert not (library.root / "data" / "seed" / "1.0.0").exists()
+
+
+def test_import_rejects_a_staged_directory_swap_and_restores_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+    project = ProjectLayout.create(tmp_path, "project")
+    target = project.module_dir("data")
+    replacement: Path | None = None
+
+    def swap_staged_directory(staged: Path, import_target: Path) -> None:
+        nonlocal replacement
+        replacement = staged.with_name(staged.name + ".replacement")
+        staged.rename(replacement)
+        staged.mkdir()
+
+    monkeypatch.setattr(
+        library_service, "_before_import_rename", swap_staged_directory, raising=False
+    )
+
+    with pytest.raises(LibraryValidationError, match="directory identity changed"):
+        library.import_version(published.ref, project)
+
+    assert target.is_dir() and list(target.iterdir()) == []
+    assert replacement is not None and replacement.is_dir()
+
+
+@pytest.mark.parametrize("failure_stage", ["original", "staged"])
+def test_import_restores_original_after_a_rename_reports_failure_post_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+    project = ProjectLayout.create(tmp_path, "project")
+    target = project.module_dir("data")
+    real_replace = library_service.durable_replace
+
+    def replace_then_fail(source: Path, destination: Path) -> None:
+        real_replace(source, destination)
+        if failure_stage == "original" and source == target:
+            raise OSError("original rename durability failure")
+        if failure_stage == "staged" and source.name.endswith(".staging"):
+            raise OSError("staged rename durability failure")
+
+    monkeypatch.setattr(library_service, "durable_replace", replace_then_fail)
+
+    with pytest.raises(OSError, match="rename durability failure"):
+        library.import_version(published.ref, project)
+
+    assert target.is_dir() and list(target.iterdir()) == []
+
+
+def test_import_preserves_the_original_backup_when_rollback_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+    project = ProjectLayout.create(tmp_path, "project")
+    target = project.module_dir("data")
+    real_replace = library_service.durable_replace
+
+    def replace_with_failed_rollback(source: Path, destination: Path) -> None:
+        if source.name.endswith(".backup") and destination == target:
+            raise OSError("rollback durability failure")
+        real_replace(source, destination)
+        if source == target:
+            raise OSError("original rename durability failure")
+
+    monkeypatch.setattr(library_service, "durable_replace", replace_with_failed_rollback)
+
+    with pytest.raises(LibraryValidationError, match="rollback incomplete"):
+        library.import_version(published.ref, project)
+
+    backups = list(target.parent.glob("*.backup"))
+    assert len(backups) == 1 and backups[0].is_dir() and list(backups[0].iterdir()) == []
+    assert not target.exists()
+
+
+def test_retry_reuses_a_persistent_lock_after_a_holder_subprocess_dies(
+    tmp_path: Path,
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    draft = valid_draft(tmp_path, "data/seed", "1.0.0")
+    staging = library.root / "data" / "seed" / ".1.0.0.dead.staging"
+    lock = library.root / ".locks" / "data" / "seed" / "1.0.0.lock"
+    script = (
+        "import os; from pathlib import Path; "
+        "from ai4sota.library.service import _PublicationLock; "
+        f"Path({str(staging)!r}).mkdir(parents=True); "
+        f"holder = _PublicationLock(Path({str(lock)!r}), 'data/seed@1.0.0'); "
+        "holder.__enter__(); os._exit(0)"
+    )
+    subprocess.run([sys.executable, "-c", script], check=True)
+    before = lock.stat().st_ino
+
+    published = library.publish(draft, expected_hash=hash_tree(draft.path))
+
+    assert published.ref == "data/seed@1.0.0"
+    assert lock.is_file() and lock.stat().st_ino == before
+    assert not staging.exists()
+
+
+def test_live_publisher_holds_the_single_persistent_lock_identity(
+    tmp_path: Path,
+) -> None:
+    library = ModuleLibrary(tmp_path / "library")
+    lock = library.root / ".locks" / "data" / "seed" / "1.0.0.lock"
+    library_service._safe_create_directory(lock.parent)
+
+    with library_service._PublicationLock(lock, "data/seed@1.0.0"):
+        first_identity = lock.stat().st_ino
+        with (
+            pytest.raises(VersionExists),
+            library_service._PublicationLock(lock, "data/seed@1.0.0"),
+        ):
+            pass
+
+    with library_service._PublicationLock(lock, "data/seed@1.0.0"):
+        assert lock.stat().st_ino == first_identity

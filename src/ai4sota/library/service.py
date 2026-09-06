@@ -68,6 +68,12 @@ class _TreeEntry:
     size: int
 
 
+@dataclass(frozen=True)
+class _VerifiedPublication:
+    root: _DirectoryIdentity
+    content_hash: str
+
+
 def hash_tree(path: Path) -> str:
     """Hash payload bytes, excluding the non-circular publication record."""
     _, digest = _tree_inventory(path)
@@ -86,9 +92,10 @@ class ModuleLibrary:
         path = _safe_child(root, kind.value, name, version)
         if not path.exists():
             raise ModuleNotFound(ref)
-        _verify_publication_tree(path, ref)
         _validate_module_tree(path, kind, f"{kind.value}/{name}", version, True)
-        return PublishedModule(ref=ref, content_hash=hash_tree(path), path=path)
+        verified = _verify_publication_tree(path, ref)
+        _after_publication_verified(path)
+        return PublishedModule(ref=ref, content_hash=verified.content_hash, path=path)
 
     def create_draft(self, ref: str) -> ModuleDraft:
         published = self.read(ref)
@@ -97,8 +104,9 @@ class ModuleLibrary:
         drafts_root = _safe_child(root, ".drafts", kind.value, name)
         _safe_create_directory(drafts_root)
         draft_path = _safe_child(drafts_root, f"{version}-{uuid4().hex}")
-        _copy_tree(published.path, draft_path)
+        draft_identity = _copy_tree(published.path, draft_path)
         _verify_publication_tree(draft_path, ref)
+        _require_directory_identity(draft_identity)
         _safe_unlink(draft_path / _PUBLICATION_RECORD)
         if hash_tree(draft_path) != published.content_hash:
             raise LibraryValidationError("draft copy does not match published payload")
@@ -124,19 +132,22 @@ class ModuleLibrary:
             staged = _safe_child(
                 destination.parent, f".{destination.name}.{uuid4().hex}.staging"
             )
+            staged_identity: _DirectoryIdentity | None = None
             try:
-                _copy_tree(draft.path, staged)
+                staged_identity = _copy_tree(draft.path, staged)
                 if hash_tree(staged) != actual_hash:
                     raise LibraryValidationError("staged module tree does not match draft")
                 _validate_module_tree(staged, kind, draft.module_id, draft.version, False)
                 _write_publication_record(staged, draft.ref)
                 _verify_publication_tree(staged, draft.ref)
                 _require_directory_identity(destination_parent_identity)
+                _before_publish_rename(staged, destination)
+                _require_directory_identity(staged_identity)
                 if destination.exists():
                     raise VersionExists(draft.ref)
                 durable_replace(staged, destination)
             except Exception:
-                _remove_staging_tree(staged)
+                _remove_staging_tree(staged, staged_identity)
                 if destination.exists():
                     raise VersionExists(draft.ref) from None
                 raise
@@ -156,9 +167,9 @@ class ModuleLibrary:
 
         staged = _safe_child(target.parent, f".{target.name}.{uuid4().hex}.staging")
         backup = _safe_child(target.parent, f".{target.name}.{uuid4().hex}.backup")
-        original_moved = False
+        staged_identity: _DirectoryIdentity | None = None
         try:
-            _copy_tree(published.path, staged)
+            staged_identity = _copy_tree(published.path, staged)
             _verify_publication_tree(staged, ref)
             _safe_unlink(staged / _PUBLICATION_RECORD)
             model = _read_module_manifest(staged / "module.yaml", kind)
@@ -175,16 +186,43 @@ class ModuleLibrary:
             _validate_module_tree(staged, kind, updated.id, updated.version, False)
             _require_directory_identity(target_identity)
             _require_directory_identity(target_parent_identity)
-            durable_replace(target, backup)
-            original_moved = True
+            try:
+                durable_replace(target, backup)
+            except Exception:
+                _restore_original_directory(
+                    target, backup, target_identity, None, target_parent_identity
+                )
+                raise
+            if not _matches_directory_identity(backup, target_identity):
+                raise LibraryValidationError("original project module identity was lost")
             _require_directory_identity(target_parent_identity)
-            durable_replace(staged, target)
+            _before_import_rename(staged, target)
+            _require_directory_identity(staged_identity)
+            try:
+                durable_replace(staged, target)
+            except Exception:
+                _restore_original_directory(
+                    target,
+                    backup,
+                    target_identity,
+                    staged_identity,
+                    target_parent_identity,
+                )
+                raise
             _capture_directory(backup)
             backup.rmdir()
         except Exception:
-            _remove_staging_tree(staged)
-            if original_moved and backup.exists() and not target.exists():
-                durable_replace(backup, target)
+            _remove_staging_tree(staged, staged_identity)
+            if _matches_directory_identity(backup, target_identity) and not _matches_directory_identity(
+                target, target_identity
+            ):
+                _restore_original_directory(
+                    target,
+                    backup,
+                    target_identity,
+                    staged_identity,
+                    target_parent_identity,
+                )
             raise
         return target
 
@@ -354,7 +392,8 @@ def _write_publication_record(root: Path, ref: str) -> None:
     )
 
 
-def _verify_publication_tree(root: Path, ref: str) -> None:
+def _verify_publication_tree(root: Path, ref: str) -> _VerifiedPublication:
+    identity = _capture_directory(root)
     record_path = _safe_child(root, _PUBLICATION_RECORD)
     try:
         record = json.loads(stable_read_file(record_path).data)
@@ -370,6 +409,20 @@ def _verify_publication_tree(root: Path, ref: str) -> None:
         or record.get("inventory") != expected_inventory
     ):
         raise LibraryValidationError("publication integrity check failed")
+    _require_directory_identity(identity)
+    return _VerifiedPublication(root=identity, content_hash=digest)
+
+
+def _after_publication_verified(path: Path) -> None:
+    """Test seam for changes arriving after an anchored publication verification."""
+
+
+def _before_publish_rename(staged: Path, destination: Path) -> None:
+    """Test seam immediately before a verified staged publication is renamed."""
+
+
+def _before_import_rename(staged: Path, target: Path) -> None:
+    """Test seam immediately before a verified staged import is renamed."""
 
 
 def _iter_regular_files(root: Path) -> list[Path]:
@@ -468,7 +521,7 @@ def _is_reparse(metadata: os.stat_result) -> bool:
     return bool(attributes & reparse_flag)
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
+def _copy_tree(source: Path, destination: Path) -> _DirectoryIdentity:
     source_identity = _capture_directory(source)
     if destination.exists():
         raise FileExistsError(destination)
@@ -485,7 +538,7 @@ def _copy_tree(source: Path, destination: Path) -> None:
             atomic_write_bytes(destination_file, data)
             _require_directory_identity(source_identity)
         _require_directory_identity(source_identity)
-        _capture_directory(destination)
+        return _capture_directory(destination)
     except Exception:
         _remove_staging_tree(destination)
         raise
@@ -502,12 +555,68 @@ def _safe_unlink(path: Path) -> None:
     path.unlink()
 
 
-def _remove_staging_tree(path: Path) -> None:
+def _remove_staging_tree(
+    path: Path, expected_identity: _DirectoryIdentity | None = None
+) -> None:
     if not path.exists():
         return
-    _capture_directory(path)
+    identity = _capture_directory(path)
+    if expected_identity is not None and identity != expected_identity:
+        return
     _iter_regular_files(path)
     shutil.rmtree(path)
+
+
+def _matches_directory_identity(path: Path, expected: _DirectoryIdentity) -> bool:
+    try:
+        actual = _capture_directory(path)
+        return (actual.device, actual.inode) == (expected.device, expected.inode)
+    except LibraryValidationError:
+        return False
+
+
+def _restore_original_directory(
+    target: Path,
+    backup: Path,
+    original: _DirectoryIdentity,
+    imported: _DirectoryIdentity | None,
+    parent: _DirectoryIdentity,
+) -> None:
+    """Reconcile uncertain rename outcomes without discarding the original tree."""
+    _require_directory_identity(parent)
+    if _matches_directory_identity(target, original):
+        return
+    if not _matches_directory_identity(backup, original):
+        raise LibraryValidationError("rollback incomplete: original backup is unavailable")
+    if target.exists():
+        if imported is None or not _matches_directory_identity(target, imported):
+            raise LibraryValidationError("rollback incomplete: target identity is unknown")
+        discarded = _safe_child(
+            target.parent, f".{target.name}.{uuid4().hex}.rollback"
+        )
+        try:
+            durable_replace(target, discarded)
+        except Exception as error:
+            if _matches_directory_identity(discarded, imported):
+                _remove_staging_tree(discarded, imported)
+            elif _matches_directory_identity(target, imported):
+                raise LibraryValidationError(
+                    "rollback incomplete: imported target was retained"
+                ) from error
+        else:
+            _remove_staging_tree(discarded, imported)
+    try:
+        durable_replace(backup, target)
+    except Exception as error:
+        if _matches_directory_identity(target, original):
+            return
+        if _matches_directory_identity(backup, original):
+            raise LibraryValidationError(
+                "rollback incomplete: original backup was preserved"
+            ) from error
+        raise LibraryValidationError("rollback incomplete: original identity was lost") from error
+    if not _matches_directory_identity(target, original):
+        raise LibraryValidationError("rollback incomplete: original identity was not restored")
 
 
 def _cleanup_interrupted_staging(parent: Path, version: str) -> None:
@@ -564,13 +673,6 @@ class _PublicationLock:
     def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
         self._unlock()
         self._close()
-        if self.identity is not None:
-            try:
-                metadata = self.path.lstat()
-            except FileNotFoundError:
-                return
-            if (metadata.st_dev, metadata.st_ino) == self.identity:
-                _safe_unlink(self.path)
 
     def _lock(self) -> None:
         if os.name == "nt":
