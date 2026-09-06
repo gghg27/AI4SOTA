@@ -12,6 +12,9 @@ AI4SOTA 桌面版 v1 的产品与架构设计已经确认。第一阶段“核�
 
 以下命令在仓库根目录执行，要求 Python 3.11 或更高版本，并使用已经填充有效 Task、Data、Method、Evaluation 清单和代码的 v1 项目。安装开发环境：
 
+使用真实 EEG 数据进行两次 Run、比较和 Research Commit 的人工验收步骤，见
+[`docs/cli-v0.1-eeg-manual-test/README.md`](docs/cli-v0.1-eeg-manual-test/README.md)。
+
 ```powershell
 python -m venv .venv
 .venv\Scripts\python -m pip install -e ".[dev]"
