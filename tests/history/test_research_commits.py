@@ -248,9 +248,14 @@ def test_commit_persists_authoritative_manifest_ref_and_exact_snapshot_tree(
 
 def test_commit_allows_snapshot_tree_identical_to_base_head(tmp_path: Path) -> None:
     project = ProjectLayout.create(tmp_path, "seed-emotion")
+    crlf_paths = (project.root / "README.md", project.task_file)
+    for path in crlf_paths:
+        lf_bytes = path.read_bytes().replace(b"\r\n", b"\n")
+        path.write_bytes(lf_bytes.replace(b"\n", b"\r\n"))
     method = project.module_dir(ModuleKind.METHOD) / "model.py"
     method.write_text("snapshot version", encoding="utf-8")
     git(project.root, "init", "-b", "main")
+    git(project.root, "config", "core.autocrlf", "true")
     git(project.root, "config", "user.name", "AI4SOTA Tests")
     git(project.root, "config", "user.email", "tests@ai4sota.invalid")
     base_sha = GitAdapter().ensure_repository(project.root, "Initial project")
@@ -268,6 +273,15 @@ def test_commit_allows_snapshot_tree_identical_to_base_head(tmp_path: Path) -> N
         "-r",
         result.git_sha,
     ) == ""
+    for path in crlf_paths:
+        relative = path.relative_to(project.root).as_posix()
+        stored = subprocess.run(
+            ["git", "show", f"{base_sha}:{relative}"],
+            cwd=project.root,
+            check=True,
+            capture_output=True,
+        ).stdout
+        assert stored == path.read_bytes()
     assert temporary_worktrees(project) == ()
 
 
