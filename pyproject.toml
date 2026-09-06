@@ -13,7 +13,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["mypy>=1.15,<2", "pytest>=8.3,<9", "pytest-cov>=6,<7", "ruff>=0.11,<1"]
+dev = [
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.11,<1",
+  "setuptools>=75",
+]
 
 [project.scripts]
 ai4sota = "ai4sota.cli:main"
