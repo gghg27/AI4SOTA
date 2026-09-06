@@ -12,6 +12,7 @@ from uuid import uuid4
 import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ValidationError
 
+from ai4sota import runtime_environment
 from ai4sota.domain import (
     DataModuleSpec,
     DatasetSourceSpec,
@@ -95,6 +96,9 @@ def prepare_run(
         project, experiment
     )
     _verify_exact_input_map(experiment, relative_inputs)
+    metric_environment_state = _metric_environment_state(
+        relative_inputs, experiment.environment
+    )
 
     run_id = f"run-{uuid4().hex}"
     run_dir = project.runs_dir / run_id
@@ -127,15 +131,6 @@ def prepare_run(
                 ],
                 "environment": experiment.environment,
             }
-        )
-        # v1 recognizes uv.lock as its deterministic resolved dependency inventory.
-        metric_environment_state: Literal["reproducible", "unresolved"] = (
-            "reproducible"
-            if (
-                "uv.lock" in relative_inputs
-                and bool(relative_inputs["uv.lock"].data.strip())
-            )
-            else "unresolved"
         )
         draft = RunManifest(
             id=run_id,
@@ -184,6 +179,24 @@ def prepare_run(
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
+
+
+def _metric_environment_state(
+    inputs: Mapping[str, StableFile], environment: Mapping[str, object]
+) -> Literal["reproducible", "unresolved"]:
+    lockfile = inputs.get("uv.lock")
+    if lockfile is None or not lockfile.data.strip():
+        return "unresolved"
+    if not runtime_environment.is_runtime_environment_identity(environment):
+        return "unresolved"
+    current = runtime_environment.capture_runtime_environment()
+    if current is None:
+        return "unresolved"
+    if current != environment:
+        raise SnapshotValidationError(
+            "runtime environment does not match the approved inventory"
+        )
+    return "reproducible"
 
 
 def snapshot_input_hashes(

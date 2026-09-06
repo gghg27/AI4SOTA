@@ -16,11 +16,14 @@ import numpy as np
 import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ValidationError
 
+from ai4sota import runtime_environment
+
 from .contracts import EvaluationResult, PredictionBundle
 from .domain import (
     DataModuleSpec,
     DatasetSourceSpec,
     EvaluationSpec,
+    ExperimentSpec,
     MethodSpec,
     ModuleKind,
     RunManifest,
@@ -183,11 +186,12 @@ def execute_run(project: ProjectLayout, run_id: str) -> RunManifest:
     run_dir = repository.run_dir(run_id)
     logs = io.StringIO()
     try:
-        verify_run_integrity(run_dir)
+        prepared = verify_run_integrity(run_dir)
         repository.transition_run(run_id, "queued", "preparing")
+        snapshot = run_dir / "snapshot"
+        _verify_snapshot_runtime_environment(snapshot, prepared)
         running = repository.transition_run(run_id, "preparing", "running")
         with contextlib.redirect_stdout(logs), contextlib.redirect_stderr(logs):
-            snapshot = run_dir / "snapshot"
             _verify_snapshot_dataset_fingerprint(snapshot, project.root, running)
             with _sealed_seed(running.seed):
                 dataset = load_snapshot_dataset(snapshot)
@@ -278,6 +282,21 @@ def execute_run(project: ProjectLayout, run_id: str) -> RunManifest:
                 bookkeeping_errors
             )
         raise RuntimeError(message) from error
+
+
+def _verify_snapshot_runtime_environment(
+    snapshot: Path, run: RunManifest
+) -> None:
+    if run.metric_environment_state != "reproducible":
+        return
+    experiment = ManifestStore().read(snapshot / "experiment.yaml", ExperimentSpec)
+    current = runtime_environment.capture_runtime_environment()
+    if (
+        not runtime_environment.is_runtime_environment_identity(experiment.environment)
+        or current is None
+        or current != experiment.environment
+    ):
+        raise ValueError("runtime environment does not match the recorded inventory")
 
 
 @contextlib.contextmanager

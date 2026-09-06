@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TypeVar
 
 import numpy as np
@@ -475,6 +477,73 @@ def test_missing_dependency_lock_blocks_metric_comparison(tmp_path: Path) -> Non
     assert comparison.metric_deltas is None
 
 
+def test_changed_runtime_inventory_blocks_comparison_with_same_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches installed evaluator dependency drift hidden by an unchanged lock."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    installed_version = "1.0.0"
+
+    def distributions() -> tuple[SimpleNamespace, ...]:
+        return (
+            SimpleNamespace(
+                metadata={"Name": "Evaluator_Runtime"},
+                version=installed_version,
+            ),
+        )
+
+    monkeypatch.setattr(importlib.metadata, "distributions", distributions)
+    first_prepared = prepare_experiment(project)
+    first = execute_approved_run(
+        project,
+        bind_experiment_approval(first_prepared, "approval/runtime-inventory-001"),
+    )
+    installed_version = "2.0.0"
+    second_prepared = prepare_experiment(project)
+    second = execute_approved_run(
+        project,
+        bind_experiment_approval(second_prepared, "approval/runtime-inventory-002"),
+    )
+
+    comparison = compare_runs([first, second])
+
+    assert first_prepared.spec.environment["distributions"] == [
+        {"name": "evaluator-runtime", "version": "1.0.0"}
+    ]
+    assert second_prepared.spec.environment["distributions"] == [
+        {"name": "evaluator-runtime", "version": "2.0.0"}
+    ]
+    assert first.metric_environment_state == "reproducible"
+    assert second.metric_environment_state == "reproducible"
+    assert first.metric_implementation_hash != second.metric_implementation_hash
+    assert comparison.state is ComparabilityState.NONE
+    assert comparison.blocking_fields == ("metric_implementation_hash",)
+    assert comparison.metric_deltas is None
+
+
+def test_unreadable_runtime_inventory_marks_run_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a failed inventory capture retaining a reproducibility claim."""
+    project = create_v1_demo_project(tmp_path / "demo")
+
+    def unreadable_inventory() -> tuple[SimpleNamespace, ...]:
+        raise OSError("injected distribution metadata failure")
+
+    monkeypatch.setattr(
+        importlib.metadata, "distributions", unreadable_inventory
+    )
+
+    completed = execute_approved_run(
+        project,
+        bind_experiment_approval(
+            prepare_experiment(project), "approval/unreadable-runtime-inventory"
+        ),
+    )
+
+    assert completed.metric_environment_state == "unresolved"
+
+
 def test_approval_hash_mismatch_is_rejected_before_run_creation(
     tmp_path: Path,
 ) -> None:
@@ -662,6 +731,36 @@ def test_runner_uses_the_immutable_snapshot_and_persists_lifecycle_metrics(
         "running",
         "succeeded",
     ]
+
+
+def test_runner_rejects_runtime_inventory_change_after_run_preparation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches execution under a runtime other than the recorded inventory."""
+    project = create_v1_demo_project(tmp_path / "demo")
+    installed_version = "1.0.0"
+
+    def distributions() -> tuple[SimpleNamespace, ...]:
+        return (
+            SimpleNamespace(
+                metadata={"Name": "Evaluator Runtime"},
+                version=installed_version,
+            ),
+        )
+
+    monkeypatch.setattr(importlib.metadata, "distributions", distributions)
+    approval = bind_experiment_approval(
+        prepare_experiment(project), "approval/runtime-changed-before-execution"
+    )
+    queued = prepare_run(project, approval.experiment)
+    installed_version = "2.0.0"
+
+    with pytest.raises(RuntimeError, match="run failed") as captured:
+        execute_run(project, queued.id)
+
+    assert captured.value.__cause__ is not None
+    assert "runtime environment does not match" in str(captured.value.__cause__)
+    assert RunRepository(project).load(queued.id).status == "failed"
 
 
 def test_runner_recovers_a_durable_success_after_projection_failure(

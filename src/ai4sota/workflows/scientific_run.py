@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import platform
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -14,6 +13,7 @@ from uuid import uuid4
 import yaml  # type: ignore[import-untyped]
 from pydantic import ValidationError, model_validator
 
+from ai4sota import runtime_environment
 from ai4sota.compatibility import CompatibilityReport, compile_compatibility
 from ai4sota.domain import (
     CompatibilityState,
@@ -139,6 +139,7 @@ def prepare_experiment(project: ProjectLayout) -> PreparedExperiment:
         f"{split.id.replace('/', '-')}-{split.content_hash[7:19]}.yaml"
     )
     ManifestStore().write(split_path, split)
+    environment = runtime_environment.capture_runtime_environment() or {}
     selection = ExperimentSpec(
         id=f"experiment-{uuid4().hex}",
         content_hash=ZERO_HASH,
@@ -153,7 +154,7 @@ def prepare_experiment(project: ProjectLayout) -> PreparedExperiment:
         input_hashes={"pending": ZERO_HASH},
         generated_adapter_hashes=(),
         runtime_config=runtime_config,
-        environment={"python": platform.python_version()},
+        environment=environment,
     )
     input_hashes = snapshot_input_hashes(project, selection)
     draft = selection.model_copy(update={"input_hashes": input_hashes})
