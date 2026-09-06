@@ -4,9 +4,86 @@
 
 ## 1. 项目状态
 
-AI4SOTA 桌面版 v1 的产品与架构设计已经确认，产品代码尚未按新架构实施。批准的规格见 `docs/superpowers/specs/2026-09-05-ai4sota-desktop-agent-design.md`，三阶段执行入口见 `docs/superpowers/plans/2026-09-05-ai4sota-implementation-program.md`。
+AI4SOTA 桌面版 v1 的产品与架构设计已经确认。第一阶段“核心与科研账本”已经实现：当前 Python 包可以校验 v1 项目、编译模块兼容性、生成受哈希约束的实验审批候选、从不可变快照执行 Run、比较 Run，并从选定 Run 的精确快照创建 Research Commit。控制服务、Agent 运行时和桌面工作台仍按后续两个计划实施。批准的规格见 `docs/superpowers/specs/2026-09-05-ai4sota-desktop-agent-design.md`，三阶段执行入口见 `docs/superpowers/plans/2026-09-05-ai4sota-implementation-program.md`。
 
 第一阶段以本地桌面应用为目标，优先支持表格数据和 EEG/ECG 等生理时序分类任务。底层接口需要保留扩展到图像、文本、图网络和多模态任务的能力，但 MVP 不追求一次覆盖所有数据与算法。
+
+### 1.1 Headless 科研流程
+
+以下命令在仓库根目录执行，要求 Python 3.11 或更高版本，并使用已经填充有效 Task、Data、Method、Evaluation 清单和代码的 v1 项目。安装开发环境：
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python -m pip install -e ".[dev]"
+```
+
+Research Commit 使用项目自己的 Git 历史。项目初始化时应显式创建仓库和首个提交；AI4SOTA 不会在实验执行时隐式初始化 Git：
+
+```powershell
+$ProjectRoot = "B:\research\demo"
+git -C $ProjectRoot init -b main
+git -C $ProjectRoot add .
+git -C $ProjectRoot commit -m "chore: initialize research project"
+```
+
+先编译三个激活模块与共享 TaskContract 的兼容性：
+
+```powershell
+.venv\Scripts\python -m ai4sota compile $ProjectRoot --json
+```
+
+准备第一个 Run。`prepare-run` 会冻结划分与完整输入闭包，并把带审批 ID 的候选写入指定文件；它不会执行实验。研究者应先检查文件内容和输出中的 `approval_hash`：
+
+```powershell
+$ApprovalOne = Join-Path $ProjectRoot ".ai4sota\approval-run-001.json"
+$CandidateOne = .venv\Scripts\python -m ai4sota prepare-run $ProjectRoot `
+  --approval-id "approval/run-001" `
+  --output $ApprovalOne `
+  --json | ConvertFrom-Json
+Get-Content -Raw $ApprovalOne
+```
+
+确认候选后，调用方必须原样回传审批哈希。候选生成后任何已绑定输入发生变化，执行都会在创建 Run 前被拒绝：
+
+```powershell
+$RunOne = .venv\Scripts\python -m ai4sota run-approved $ProjectRoot $ApprovalOne `
+  --approval-hash $CandidateOne.approval_hash `
+  --json | ConvertFrom-Json
+```
+
+修改模块后，必须生成并检查新的审批候选，再执行第二个 Run：
+
+```powershell
+$ApprovalTwo = Join-Path $ProjectRoot ".ai4sota\approval-run-002.json"
+$CandidateTwo = .venv\Scripts\python -m ai4sota prepare-run $ProjectRoot `
+  --approval-id "approval/run-002" `
+  --output $ApprovalTwo `
+  --json | ConvertFrom-Json
+$RunTwo = .venv\Scripts\python -m ai4sota run-approved $ProjectRoot $ApprovalTwo `
+  --approval-hash $CandidateTwo.approval_hash `
+  --json | ConvertFrom-Json
+```
+
+比较命令会重新校验每个 Run 的不可变快照。只有比较策略允许时才返回指标差值；`not_comparable` 不返回差值：
+
+```powershell
+.venv\Scripts\python -m ai4sota compare $ProjectRoot `
+  $RunOne.id $RunTwo.id --json
+```
+
+最后，准备研究结论草稿并从选定 Run 的精确快照创建 Research Commit。即使实时工作区后来发生变化，提交树仍与选定 Run 一致，且不会重置或覆盖实时工作区：
+
+```powershell
+$Draft = Join-Path $ProjectRoot ".ai4sota\research-commit-run-002.json"
+@{
+  id = "research-commit-run-002"
+  project_id = $RunTwo.project_id
+} | ConvertTo-Json | Set-Content -Path $Draft -Encoding utf8
+.venv\Scripts\python -m ai4sota research-commit $ProjectRoot `
+  $Draft $RunTwo.id --json
+```
+
+所有五个命令的 `--json` 输出均为单个机器可读 JSON 文档；错误写入标准错误并返回非零退出码。
 
 ## 2. 为什么做 AI4SOTA
 

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import random
 from collections.abc import Sequence
@@ -13,6 +11,9 @@ import numpy as np
 from ai4sota.contracts import CanonicalDataset
 from ai4sota.domain.experiments import SplitManifest, SplitMember
 from ai4sota.domain.modules import EvaluationSpec, SplitProtocolSpec
+from ai4sota.storage import canonical_manifest_hash
+
+ZERO_HASH = "sha256:" + "0" * 64
 
 
 def materialize_split(
@@ -37,20 +38,24 @@ def materialize_split(
         SplitMember(sample_id=sample_id, partition=assignments[group])
         for sample_id, group in zip(sample_ids, groups, strict=True)
     )
-    manifest_payload = {
-        "evaluation_hash": evaluation.content_hash,
-        "seed": seed,
-        "group_by": group_field,
-        "members": [member.model_dump(mode="json") for member in members],
-    }
-    content_hash = _content_hash(manifest_payload)
-    manifest = SplitManifest(
-        id=f"split/{content_hash.removeprefix('sha256:')[:16]}",
-        content_hash=content_hash,
+    identity_hash = canonical_manifest_hash(
+        {
+            "evaluation_hash": evaluation.content_hash,
+            "seed": seed,
+            "group_by": group_field,
+            "members": [member.model_dump(mode="json") for member in members],
+        }
+    )
+    draft = SplitManifest(
+        id=f"split/{identity_hash.removeprefix('sha256:')[:16]}",
+        content_hash=ZERO_HASH,
         evaluation_hash=evaluation.content_hash,
         seed=seed,
         group_by=group_field,
         members=members,
+    )
+    manifest = draft.model_copy(
+        update={"content_hash": canonical_manifest_hash(draft)}
     )
     validate_no_group_leakage(manifest, groups)
     return manifest
@@ -135,8 +140,3 @@ def _is_missing_identifier(value: object) -> bool:
     if isinstance(value, (np.datetime64, np.timedelta64)):
         return bool(np.isnat(value))
     return False
-
-
-def _content_hash(payload: dict[str, object]) -> str:
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-    return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"

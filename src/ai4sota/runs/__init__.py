@@ -29,10 +29,16 @@ from .repository import (
     RunStateConflict,
     load_run_manifest,
     manifest_hash,
+    record_run_metrics,
     transition_run,
     verify_run_integrity,
 )
-from .snapshots import SnapshotValidationError, hash_tree, prepare_run
+from .snapshots import (
+    SnapshotValidationError,
+    hash_tree,
+    prepare_run,
+    snapshot_input_hashes,
+)
 
 __all__ = [
     "ALLOWED_TRANSITIONS",
@@ -62,6 +68,8 @@ __all__ = [
     "load_run_manifest",
     "manifest_hash",
     "prepare_run",
+    "record_run_metrics",
+    "snapshot_input_hashes",
     "transition_run",
     "verify_run_integrity",
 ]

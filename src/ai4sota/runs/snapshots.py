@@ -81,6 +81,99 @@ def prepare_run(
         raise SnapshotValidationError("repetition seed must be an integer")
     _verify_model_hash(experiment, "experiment")
 
+    relative_inputs, source, evaluation = _capture_snapshot_inputs(
+        project, experiment
+    )
+    _verify_exact_input_map(experiment, relative_inputs)
+
+    run_id = f"run-{uuid4().hex}"
+    run_dir = project.runs_dir / run_id
+    staging = project.index_file.parent / run_id
+    if run_dir.exists():
+        raise FileExistsError(f"Run directory already exists: {run_dir}")
+    durable_make_directory(staging)
+    try:
+        snapshot = staging / "snapshot"
+        for relative_path, value in sorted(relative_inputs.items()):
+            atomic_write_bytes(snapshot / relative_path, value.data)
+        ManifestStore().write(snapshot / "experiment.yaml", experiment)
+
+        snapshot_hash = hash_tree(snapshot)
+        protocol_hash = canonical_manifest_hash(
+            {"protocol": evaluation.protocol.model_dump(mode="json")}
+        )
+        evaluation_prefix = f"modules/{ModuleKind.EVALUATION.value}/current/"
+        metric_hash = canonical_manifest_hash(
+            {
+                "evaluation_files": [
+                    {"path": path, "sha256": value.sha256}
+                    for path, value in sorted(relative_inputs.items())
+                    if path.startswith(evaluation_prefix)
+                ]
+            }
+        )
+        draft = RunManifest(
+            id=run_id,
+            content_hash="sha256:" + "0" * 64,
+            project_id=experiment.project_id,
+            experiment_hash=experiment.content_hash,
+            snapshot_hash=snapshot_hash,
+            data_fingerprint_hash=experiment.data_fingerprint_hash,
+            task_contract_hash=experiment.task_contract_hash,
+            split_manifest_hash=experiment.split_manifest_hash,
+            evaluation_protocol_hash=protocol_hash,
+            metric_implementation_hash=metric_hash,
+            integrity_state="verified",
+            status="queued",
+            seed=run_seed,
+        )
+        manifest = draft.model_copy(
+            update={"content_hash": canonical_manifest_hash(draft)}
+        )
+        ManifestStore().write(staging / "manifest.yaml", manifest)
+        for name in ("logs", "metrics", "artifacts"):
+            durable_make_directory(staging / name)
+        append_run_event(
+            staging,
+            RunEvent(
+                id=f"event-{uuid4().hex}",
+                run_id=run_id,
+                event_type="run_prepared",
+                status="queued",
+                details={
+                    "approval_id": experiment.approval_id,
+                    "repetition_coordinates": {"seed": run_seed},
+                },
+            ),
+        )
+        _verify_external_fingerprint(source, experiment.data_fingerprint_hash)
+        if hash_tree(snapshot) != snapshot_hash:
+            raise SnapshotValidationError(
+                "staged snapshot changed before durable publication"
+            )
+        durable_replace(staging, run_dir)
+        return manifest
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def snapshot_input_hashes(
+    project: ProjectLayout, experiment_selection: ExperimentSpec
+) -> dict[str, str]:
+    """Capture Task 7's exact input closure for a prospective experiment."""
+    relative_inputs, _, _ = _capture_snapshot_inputs(
+        project, experiment_selection
+    )
+    return {
+        path: value.sha256
+        for path, value in sorted(relative_inputs.items())
+    }
+
+
+def _capture_snapshot_inputs(
+    project: ProjectLayout, experiment: ExperimentSpec
+) -> tuple[dict[str, StableFile], DatasetSourceSpec, EvaluationSpec]:
     project_file = _read_file(project.project_file, "project manifest")
     project_spec = _verified_manifest(
         project.project_file, project_file, ProjectSpec, "project manifest"
@@ -172,7 +265,7 @@ def prepare_run(
     inputs.update(config_files)
     inputs.update(schema_files)
     inputs.update(root_files)
-    relative_inputs = _verify_exact_input_map(project, experiment, inputs)
+    relative_inputs = _relative_input_map(project, inputs)
 
     _verify_semantic_closure(
         experiment,
@@ -184,74 +277,7 @@ def prepare_run(
         source,
         fingerprint_record,
     )
-
-    run_id = f"run-{uuid4().hex}"
-    run_dir = project.runs_dir / run_id
-    staging = project.index_file.parent / run_id
-    if run_dir.exists():
-        raise FileExistsError(f"Run directory already exists: {run_dir}")
-    durable_make_directory(staging)
-    try:
-        snapshot = staging / "snapshot"
-        for relative_path, value in sorted(relative_inputs.items()):
-            atomic_write_bytes(snapshot / relative_path, value.data)
-        ManifestStore().write(snapshot / "experiment.yaml", experiment)
-
-        snapshot_hash = hash_tree(snapshot)
-        protocol_hash = canonical_manifest_hash(
-            {"protocol": evaluation.protocol.model_dump(mode="json")}
-        )
-        metric_hash = canonical_manifest_hash(
-            {
-                "metrics": [
-                    metric.model_dump(mode="json") for metric in evaluation.metrics
-                ]
-            }
-        )
-        draft = RunManifest(
-            id=run_id,
-            content_hash="sha256:" + "0" * 64,
-            project_id=experiment.project_id,
-            experiment_hash=experiment.content_hash,
-            snapshot_hash=snapshot_hash,
-            data_fingerprint_hash=experiment.data_fingerprint_hash,
-            task_contract_hash=experiment.task_contract_hash,
-            split_manifest_hash=experiment.split_manifest_hash,
-            evaluation_protocol_hash=protocol_hash,
-            metric_implementation_hash=metric_hash,
-            integrity_state="verified",
-            status="queued",
-            seed=run_seed,
-        )
-        manifest = draft.model_copy(
-            update={"content_hash": canonical_manifest_hash(draft)}
-        )
-        ManifestStore().write(staging / "manifest.yaml", manifest)
-        for name in ("logs", "metrics", "artifacts"):
-            durable_make_directory(staging / name)
-        append_run_event(
-            staging,
-            RunEvent(
-                id=f"event-{uuid4().hex}",
-                run_id=run_id,
-                event_type="run_prepared",
-                status="queued",
-                details={
-                    "approval_id": experiment.approval_id,
-                    "repetition_coordinates": {"seed": run_seed},
-                },
-            ),
-        )
-        _verify_external_fingerprint(source, experiment.data_fingerprint_hash)
-        if hash_tree(snapshot) != snapshot_hash:
-            raise SnapshotValidationError(
-                "staged snapshot changed before durable publication"
-            )
-        durable_replace(staging, run_dir)
-        return manifest
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+    return relative_inputs, source, evaluation
 
 
 def _verify_active_project_references(
@@ -272,10 +298,8 @@ def _verify_active_project_references(
             )
 
 
-def _verify_exact_input_map(
-    project: ProjectLayout,
-    experiment: ExperimentSpec,
-    inputs: Mapping[Path, StableFile],
+def _relative_input_map(
+    project: ProjectLayout, inputs: Mapping[Path, StableFile]
 ) -> dict[str, StableFile]:
     relative: dict[str, StableFile] = {}
     for path, value in inputs.items():
@@ -287,7 +311,13 @@ def _verify_exact_input_map(
             ) from error
         relative[key] = value
 
-    actual_hashes = {path: value.sha256 for path, value in relative.items()}
+    return relative
+
+
+def _verify_exact_input_map(
+    experiment: ExperimentSpec, inputs: Mapping[str, StableFile]
+) -> None:
+    actual_hashes = {path: value.sha256 for path, value in inputs.items()}
     expected_paths = set(experiment.input_hashes)
     actual_paths = set(actual_hashes)
     if expected_paths != actual_paths:
@@ -303,7 +333,6 @@ def _verify_exact_input_map(
     )
     if changed:
         raise SnapshotValidationError(f"approved input hash mismatch: {changed}")
-    return relative
 
 
 def _verify_semantic_closure(

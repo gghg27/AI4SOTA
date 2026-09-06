@@ -20,6 +20,7 @@ from ai4sota.runs import (
     append_run_event,
     hash_tree,
     load_run_manifest,
+    record_run_metrics,
     transition_run,
     verify_run_integrity,
 )
@@ -348,6 +349,39 @@ def test_transition_recovers_a_durable_event_after_projection_failure(
     assert recovered.status == "preparing"
     assert load_run_manifest(run_dir) == recovered
     assert (run_dir / "events.jsonl").read_bytes().count(b"\n") == 1
+
+
+def test_transition_recovers_durable_metrics_before_terminal_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a later state projection discarding durably recorded metrics."""
+    run_dir = tmp_path / "run-001"
+    make_run(run_dir, status="running")
+    real_write = ManifestStore.write
+    failed_once = False
+
+    def fail_metric_projection(
+        store: ManifestStore, path: Path, value: object
+    ) -> None:
+        nonlocal failed_once
+        if (
+            not failed_once
+            and path == run_dir / "manifest.yaml"
+            and getattr(value, "metrics", None) == {"accuracy": 0.75}
+        ):
+            failed_once = True
+            raise OSError("injected metric projection failure")
+        real_write(store, path, value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ManifestStore, "write", fail_metric_projection)
+    with pytest.raises(RunPersistenceError, match="metrics projection"):
+        record_run_metrics(run_dir, {"accuracy": 0.75})
+
+    completed = transition_run(run_dir, expected="running", target="succeeded")
+
+    assert completed.status == "succeeded"
+    assert completed.metrics == {"accuracy": 0.75}
+    assert load_run_manifest(run_dir) == completed
 
 
 @pytest.mark.parametrize(

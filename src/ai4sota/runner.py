@@ -2,19 +2,54 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
+import random
+import re
+import sys
 import traceback
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+from pydantic import BaseModel, ValidationError
+
 from .contracts import EvaluationResult, PredictionBundle
+from .domain import (
+    DataModuleSpec,
+    DatasetSourceSpec,
+    EvaluationSpec,
+    MethodSpec,
+    ModuleKind,
+    RunManifest,
+    SplitManifest,
+)
+from .files import sha256_file
 from .io_utils import read_json, read_yaml, utc_now, write_json
 from .loading import load_project_module, require_callable
 from .project import resolve_project
-from .runs import prepare_run
+from .projects import ProjectLayout
+from .runs import (
+    RunPersistenceError,
+    RunRepository,
+    prepare_run,
+    verify_run_integrity,
+)
+from .storage import ManifestStore, atomic_write_bytes
 from .validation import validate_project
 
-__all__ = ["load_history", "prepare_run", "run_project"]
+__all__ = [
+    "execute_run",
+    "load_history",
+    "load_snapshot_dataset",
+    "prepare_run",
+    "run_project",
+]
+
+_ENTRYPOINT_PATTERN = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*"
+)
 
 
 def run_project(project_path: Path, note: str = "") -> dict[str, Any]:
@@ -113,3 +148,276 @@ def _new_run_id(project_dir: Path) -> str:
         candidate = f"{base}_{suffix:02d}"
         suffix += 1
     return candidate
+
+
+def load_snapshot_dataset(snapshot_root: Path) -> Any:
+    """Load and validate Data output only from a captured snapshot tree."""
+    snapshot = Path(snapshot_root)
+    data = ManifestStore().read(
+        snapshot / "modules" / "data" / "current" / "module.yaml",
+        DataModuleSpec,
+    )
+    config = _module_config(snapshot, ModuleKind.DATA)
+    load_dataset = _snapshot_callable(
+        snapshot, ModuleKind.DATA, data.entrypoint, "data"
+    )
+    dataset = load_dataset(project_dir=snapshot, config=config)
+    from .contracts import CanonicalDataset
+
+    if not isinstance(dataset, CanonicalDataset):
+        raise TypeError("data entrypoint must return CanonicalDataset")
+    dataset.validate()
+    return dataset
+
+
+def execute_run(project: ProjectLayout, run_id: str) -> RunManifest:
+    """Execute a prepared Run exclusively from its immutable snapshot."""
+    repository = RunRepository(project)
+    run_dir = repository.run_dir(run_id)
+    logs = io.StringIO()
+    try:
+        verify_run_integrity(run_dir)
+        repository.transition_run(run_id, "queued", "preparing")
+        running = repository.transition_run(run_id, "preparing", "running")
+        with contextlib.redirect_stdout(logs), contextlib.redirect_stderr(logs):
+            snapshot = run_dir / "snapshot"
+            _verify_snapshot_dataset_fingerprint(snapshot, running)
+            with _sealed_seed(running.seed):
+                dataset = load_snapshot_dataset(snapshot)
+                dataset = _apply_split(snapshot, running, dataset)
+                method = ManifestStore().read(
+                    snapshot
+                    / "modules"
+                    / "method"
+                    / "current"
+                    / "module.yaml",
+                    MethodSpec,
+                )
+                evaluation = ManifestStore().read(
+                    snapshot
+                    / "modules"
+                    / "evaluation"
+                    / "current"
+                    / "module.yaml",
+                    EvaluationSpec,
+                )
+                fit_predict = _snapshot_callable(
+                    snapshot, ModuleKind.METHOD, method.entrypoint, "method"
+                )
+                evaluate = _snapshot_callable(
+                    snapshot,
+                    ModuleKind.EVALUATION,
+                    evaluation.entrypoint,
+                    "evaluation",
+                )
+                predictions = fit_predict(
+                    dataset=dataset,
+                    config=_module_config(snapshot, ModuleKind.METHOD),
+                )
+                if not isinstance(predictions, PredictionBundle):
+                    raise TypeError("method entrypoint must return PredictionBundle")
+                predictions.validate()
+                result = evaluate(
+                    dataset=dataset,
+                    predictions=predictions,
+                    config=_module_config(snapshot, ModuleKind.EVALUATION),
+                )
+                if not isinstance(result, EvaluationResult):
+                    raise TypeError(
+                        "evaluation entrypoint must return EvaluationResult"
+                    )
+                result.validate()
+
+            atomic_write_bytes(
+                run_dir / "metrics" / "metrics.json",
+                _json_bytes(result.metrics),
+            )
+            if result.tables:
+                atomic_write_bytes(
+                    run_dir / "metrics" / "tables.json",
+                    _json_bytes(result.tables),
+                )
+            repository.record_metrics(run_id, result.metrics)
+            atomic_write_bytes(
+                run_dir / "logs" / "worker.log",
+                logs.getvalue().encode("utf-8"),
+            )
+            try:
+                completed = repository.transition_run(
+                    run_id, "running", "succeeded"
+                )
+            except RunPersistenceError:
+                completed = repository.transition_run(
+                    run_id, "running", "succeeded"
+                )
+        return completed
+    except Exception as error:
+        traceback.print_exc(file=logs)
+        bookkeeping_errors: list[str] = []
+        try:
+            atomic_write_bytes(
+                run_dir / "logs" / "worker.log",
+                logs.getvalue().encode("utf-8"),
+            )
+        except Exception as bookkeeping_error:  # noqa: BLE001
+            bookkeeping_errors.append(f"worker log: {bookkeeping_error}")
+        try:
+            current = repository.load(run_id)
+            if current.status in {"preparing", "running"}:
+                repository.transition_run(run_id, current.status, "failed")
+        except Exception as bookkeeping_error:  # noqa: BLE001
+            bookkeeping_errors.append(f"failure state: {bookkeeping_error}")
+        message = f"run failed; details saved in {run_dir}"
+        if bookkeeping_errors:
+            message += "; failure bookkeeping incomplete: " + "; ".join(
+                bookkeeping_errors
+            )
+        raise RuntimeError(message) from error
+
+
+@contextlib.contextmanager
+def _sealed_seed(seed: int | None):
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    try:
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed % (2**32))
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+
+
+def _snapshot_callable(
+    snapshot: Path,
+    kind: ModuleKind,
+    entrypoint: str,
+    role: str,
+) -> Callable[..., Any]:
+    parts = entrypoint.split(":")
+    if (
+        len(parts) != 2
+        or _ENTRYPOINT_PATTERN.fullmatch(parts[0]) is None
+        or _ENTRYPOINT_PATTERN.fullmatch(parts[1]) is None
+    ):
+        raise ValueError(f"invalid {role} entrypoint: {entrypoint!r}")
+    relative = Path(*parts[0].split(".")).with_suffix(".py")
+    module_root = snapshot / "modules" / kind.value / "current"
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        module = load_project_module(module_root, relative.as_posix(), role)
+    finally:
+        sys.dont_write_bytecode = previous
+    return require_callable(module, parts[1], role)
+
+
+def _module_config(snapshot: Path, kind: ModuleKind) -> dict[str, Any]:
+    path = snapshot / "modules" / kind.value / "current" / "config.yaml"
+    if not path.exists():
+        return {}
+    return read_yaml(path)
+
+
+def _apply_split(snapshot: Path, run: RunManifest, dataset: Any) -> Any:
+    from .contracts import CanonicalDataset
+
+    split = _load_selected_manifest(
+        snapshot / "data" / "splits",
+        SplitManifest,
+        run.split_manifest_hash,
+        "split manifest",
+    )
+    assignments = {member.sample_id: member.partition for member in split.members}
+    sample_ids = tuple(str(value) for value in np.asarray(dataset.sample_ids))
+    if set(sample_ids) != set(assignments) or len(sample_ids) != len(assignments):
+        raise ValueError("Run split members do not match the loaded dataset")
+    metadata = dict(dataset.metadata)
+    metadata["split"] = np.asarray(
+        [assignments[sample_id] for sample_id in sample_ids]
+    )
+    result = CanonicalDataset(
+        sample_ids=np.asarray(dataset.sample_ids),
+        inputs=dict(dataset.inputs),
+        targets=dict(dataset.targets),
+        metadata=metadata,
+        schema=dict(dataset.schema),
+    )
+    result.validate()
+    return result
+
+
+def _verify_snapshot_dataset_fingerprint(
+    snapshot: Path, run: RunManifest
+) -> None:
+    data_root = snapshot / "modules" / "data" / "current"
+    data = ManifestStore().read(data_root / "module.yaml", DataModuleSpec)
+    source = _load_manifest_by_id(
+        data_root, DatasetSourceSpec, data.source, "dataset source"
+    )
+    if len(source.locations) != 1:
+        raise ValueError("Run requires exactly one external dataset location")
+    actual = sha256_file(Path(source.locations[0]))
+    if actual != run.data_fingerprint_hash:
+        raise ValueError(
+            f"external dataset fingerprint changed: expected "
+            f"{run.data_fingerprint_hash}, found {actual}"
+        )
+
+
+def _load_manifest_by_id(
+    root: Path,
+    model: type[BaseModel],
+    expected_id: str,
+    label: str,
+) -> Any:
+    matches: list[BaseModel] = []
+    for path in sorted(root.glob("*.yaml")):
+        try:
+            value = ManifestStore().read(path, model)
+        except ValidationError:
+            continue
+        if getattr(value, "id", None) == expected_id:
+            matches.append(value)
+    if len(matches) != 1:
+        raise ValueError(f"{label} id matched {len(matches)} manifests")
+    return matches[0]
+
+
+def _load_selected_manifest(
+    root: Path,
+    model: type[BaseModel],
+    expected_hash: str,
+    label: str,
+) -> Any:
+    matches: list[BaseModel] = []
+    for path in sorted(root.glob("*.yaml")):
+        try:
+            value = ManifestStore().read(path, model)
+        except ValidationError:
+            continue
+        if getattr(value, "content_hash", None) == expected_hash:
+            matches.append(value)
+    if len(matches) != 1:
+        raise ValueError(f"{label} hash matched {len(matches)} manifests")
+    return matches[0]
+
+
+def _json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            indent=2,
+            default=_json_default,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _json_default(value: object) -> object:
+    if hasattr(value, "item"):
+        return value.item()
+    raise TypeError(f"cannot serialize {type(value).__name__}")
